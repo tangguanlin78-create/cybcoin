@@ -70,6 +70,9 @@ systemd 守护（Linux 服务器常驻）：
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -130,6 +133,7 @@ RETRY_BACKOFF_BASE = 2.0  # 指数退避基数（秒）
 SENSITIVE_ENV_MAP = {
     "rpc_url": "RPC_URL",
     "feishu_webhook_url": "FEISHU_WEBHOOK_URL",
+    "feishu_webhook_secret": "FEISHU_WEBHOOK_SECRET",
     "coingecko_api_key": "COINGECKO_API_KEY",
 }
 
@@ -611,9 +615,40 @@ def parse_transfer_log(log: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # 飞书 webhook 推送
 # ------------------------------------------------------------------
 
-def send_feishu_alert(webhook_url: str, title: str, content_lines: List[str], link: str) -> bool:
+def _feishu_sign(secret: str) -> tuple[str, str]:
+    """飞书机器人签名算法（安全设置 → 签名校验时需要）。
+
+    文档: https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot
+    1. timestamp = 当前秒级时间戳
+    2. string_to_sign = f"{timestamp}\n{secret}"
+    3. sign = base64(hmac_sha256(string_to_sign, secret))
+    """
+    timestamp = str(int(time.time()))
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(
+        string_to_sign.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).digest()
+    sign = base64.b64encode(hmac_code).decode("utf-8")
+    return timestamp, sign
+
+
+def send_feishu_alert(
+    webhook_url: str,
+    title: str,
+    content_lines: List[str],
+    link: str,
+    secret: Optional[str] = None,
+) -> bool:
     """组装飞书交互式卡片消息并 POST 到 webhook。
     成功返回 True。失败返回 False（不阻塞主循环，下一轮还会尝试但会被去重）。
+
+    Args:
+        webhook_url: 飞书机器人 webhook URL
+        title: 卡片标题
+        content_lines: 正文行列表
+        link: 交易浏览器链接（卡片底部按钮）
+        secret: 签名密钥（可选，仅当机器人开启签名校验时传入）
     """
     # 卡片正文：每行一段 + 末尾交易链接
     content_elements = [{"tag": "div", "text": {"tag": "lark_md",
@@ -628,7 +663,7 @@ def send_feishu_alert(webhook_url: str, title: str, content_lines: List[str], li
         }],
     })
 
-    payload = {
+    payload: Dict[str, Any] = {
         "msg_type": "interactive",
         "card": {
             "header": {
@@ -638,6 +673,12 @@ def send_feishu_alert(webhook_url: str, title: str, content_lines: List[str], li
             "elements": content_elements,
         },
     }
+
+    # 签名校验（机器人安全设置开启"签名校验"时必须携带 timestamp + sign）
+    if secret:
+        timestamp, sign = _feishu_sign(secret)
+        payload["timestamp"] = timestamp
+        payload["sign"] = sign
 
     resp = http_request_with_retry(
         "POST", webhook_url,
@@ -702,6 +743,7 @@ class TransferMonitor:
         self.exchanges.init()
         self.state = load_state(self.config.get("state_file", "monitor_state.json"))
         self.feishu_webhook = self.config["feishu_webhook_url"]
+        self.feishu_webhook_secret = self.config.get("feishu_webhook_secret") or None
         self.tx_link_prefix = EXPLORER_TX_PREFIX.get(self.chain, EXPLORER_TX_PREFIX["ethereum"])
 
         logging.info(
@@ -781,7 +823,10 @@ class TransferMonitor:
 
         # 推送飞书（未配置 webhook 时跳过，仅记日志）
         if self.feishu_webhook:
-            ok = send_feishu_alert(self.feishu_webhook, title, lines, tx_link)
+            ok = send_feishu_alert(
+                self.feishu_webhook, title, lines, tx_link,
+                secret=self.feishu_webhook_secret,
+            )
             # 无论推送是否成功都标记已告警，防止失败时无限重推刷屏
             # （若希望失败重推可改为仅在 ok=True 时标记）
             self._mark_alerted(tx_hash)
