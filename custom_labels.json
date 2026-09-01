@@ -1,0 +1,9 @@
+{
+  "_comment": "自定义标签库（手动维护，不随 CI 覆盖）。合并优先级低于公开源，同地址时公开源的更长标签胜出；如需强制覆盖请加长此处标签文字。",
+  "addresses": {
+    "0x694fa0816999da16e8783c0f5cde68c13a33c4e6": "HEMI Whale #1 (持仓53%)",
+    "0x200d04d82edc27e52286a382c0c9580a9a6eadd1": "HEMI Whale #4 (持仓3.4%)",
+    "0xd9a436d687b04dd5cd3edc3325c9776fba685159": "HEMI Whale #10",
+    "0x5eaa10f99e7e6d177ef9f74e519e319aa49f191e": "Hemi L1 Standard Bridge (跨链桥)"
+  }
+}

@@ -4,12 +4,17 @@
     {
       "name": "VHRanger-tether-known-addresses",
       "url": "https://raw.githubusercontent.com/VHRanger/tether/main/data/known_addresses.json",
-      "_note": "扁平 map 格式，混合多链（BTC/XRP/ETH）。脚本会自动过滤出 0x 开头 42 字符的 EVM 地址。约 54 个 EVM 地址，含 binance/coinbase/bitfinex/huobi/ftx 等标签。MIT 许可证。"
+      "_note": "扁平 map 格式，混合多链（BTC/XRP/ETH）。脚本自动过滤 0x 开头 42 字符的 EVM 地址。约 54 个 EVM 地址。MIT 许可证。"
     },
     {
       "name": "DataDr69-CEX-CSV",
       "url": "cex_labels.json",
-      "_note": "本地文件，由 GitHub Actions 工作流中 csv_to_labels.py 从 DataDr69 CEX CSV 转换生成。本地手动运行需先执行：python csv_to_labels.py -i https://raw.githubusercontent.com/DataDr69/labeled_ethereum_addresses_dataset/main/csv/01_cex_labels.csv -o cex_labels.json。约 360 个 CEX 地址。"
+      "_note": "本地文件，由 CI 工作流中 csv_to_labels.py 从 DataDr69 CEX CSV 转换生成（本地运行需先执行转换命令）。约 360 个 CEX 地址。"
+    },
+    {
+      "name": "custom-labels",
+      "url": "custom_labels.json",
+      "_note": "本地自定义标签（手动维护，随仓库提交）。HEMI 巨鲸与跨链桥地址等公开源不含的地址。"
     }
   ]
 }
