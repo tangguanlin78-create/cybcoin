@@ -1,11 +1,14 @@
 # ERC20 代币转账监控程序依赖
 # 安装： pip install -r requirements.txt
+# 注意：本程序使用纯 JSON-RPC（requests 直接 POST），无需 web3 库，
+#       避免了 web3 的 C 扩展编译依赖（ckzg / lru-dict 需要 Visual C++ Build Tools）
 
-# Web3 - 与以太坊兼容链 RPC 交互（获取区块、解析事件日志）
-web3>=6.0.0,<7.0.0
-
-# requests - HTTP 客户端，用于调用飞书 webhook 与 CoinGecko 价格 API
+# requests - HTTP 客户端：
+#   1) 以太坊 JSON-RPC 调用（eth_blockNumber / eth_getLogs / eth_call）
+#   2) 飞书 webhook 告警推送
+#   3) CoinGecko 价格 API
+#   4) 交易所标签库远程拉取
 requests>=2.28.0
 
-# python-dotenv - 从 .env 文件加载敏感配置（webhook、rpc url 等）
+# python-dotenv - 从 .env 文件加载敏感配置（RPC_URL / FEISHU_WEBHOOK_URL / COINGECKO_API_KEY）
 python-dotenv>=1.0.0

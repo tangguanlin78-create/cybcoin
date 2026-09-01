@@ -79,15 +79,17 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
-from web3 import Web3
 
 # ------------------------------------------------------------------
 # 常量
 # ------------------------------------------------------------------
 
 # Transfer(address indexed from, address indexed to, uint256 value) 的 keccak256 主题
-# 显式补 0x 前缀，保证与 web3.py / RPC 节点 filter 解析一致
-TRANSFER_EVENT_TOPIC = "0x" + Web3.keccak(text="Transfer(address,address,uint256)").hex()
+# 纯 JSON-RPC 实现，不依赖 web3 库。此值为 ERC20 标准事件签名的 keccak256，全局唯一。
+TRANSFER_EVENT_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+# ERC20 decimals() 函数选择器：keccak256("decimals()") 的前 4 字节
+DECIMALS_SELECTOR = "0x313ce567"
 
 # 各链区块浏览器交易页前缀，用于拼接可点击的 tx 链接
 EXPLORER_TX_PREFIX = {
@@ -154,13 +156,14 @@ def load_config(path: str) -> Dict[str, Any]:
             cfg[cfg_key] = env_val.strip()
 
     # 3) 基本校验
-    required = ["rpc_url", "token_contract", "coingecko_id", "feishu_webhook_url"]
+    required = ["rpc_url", "token_contract", "coingecko_id"]
     for key in required:
         if not cfg.get(key):
             raise ValueError(
                 f"配置项 {key} 不能为空。请在 config.json 中填写，或在 .env / 环境变量 "
                 f"{SENSITIVE_ENV_MAP.get(key, key.upper())} 中设置。"
             )
+    # 飞书 webhook 可选：未配置时跳过推送（方便先测试 RPC / 监控逻辑）
     return cfg
 
 
@@ -433,101 +436,164 @@ class PriceOracle:
 
 
 # ------------------------------------------------------------------
-# Web3 初始化与 Transfer 日志解析
+# 纯 JSON-RPC 客户端（替代 web3 库，无 C 扩展编译依赖）
 # ------------------------------------------------------------------
 
-def init_web3(rpc_url: str) -> Web3:
-    """初始化 Web3 并校验连接。失败直接退出。"""
-    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 20}))
-    if not w3.is_connected():
+class EthRpcClient:
+    """轻量以太坊 JSON-RPC 客户端，覆盖本程序所需的全部调用。"""
+
+    def __init__(self, rpc_url: str):
+        self.rpc_url = rpc_url.rstrip("/")
+        self._session = requests.Session()
+
+    def _call(self, method: str, params: list, timeout: int = 20) -> Any:
+        """发送 JSON-RPC 请求并返回 result 字段。失败返回 None。"""
+        payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
+        resp = http_request_with_retry(
+            "POST", self.rpc_url,
+            headers={"Content-Type": "application/json"},
+            json_body=payload, timeout=timeout,
+        )
+        if resp is None or resp.status_code != 200:
+            logging.error(
+                "RPC %s 失败 status=%s body=%s",
+                method, getattr(resp, "status_code", None),
+                getattr(resp, "text", "")[:200],
+            )
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            logging.error("RPC %s 响应非 JSON: %s", method, resp.text[:200])
+            return None
+        if "error" in body:
+            logging.error("RPC %s 返回错误: %s", method, body["error"])
+            return None
+        return body.get("result")
+
+    def is_connected(self) -> bool:
+        """通过 web3_clientVersion 检查连接。"""
+        result = self._call("web3_clientVersion", [])
+        return result is not None
+
+    def block_number(self) -> int:
+        """获取最新区块号。"""
+        result = self._call("eth_blockNumber", [])
+        if result is None:
+            return 0
+        return int(result, 16)
+
+    def get_logs(self, from_block: int, to_block: int, address: str,
+                 topics: List[str]) -> List[Dict[str, Any]]:
+        """拉取事件日志。params 中的 fromBlock / toBlock 需传十六进制字符串。"""
+        params = [{
+            "fromBlock": hex(from_block),
+            "toBlock": hex(to_block),
+            "address": address,
+            "topics": topics,
+        }]
+        # eth_getLogs 偶发会因 RPC 节点限制 (block range) 失败，外层重试
+        for attempt in range(1, MAX_RETRIES + 1):
+            result = self._call("eth_getLogs", params, timeout=30)
+            if result is None:
+                wait = RETRY_BACKOFF_BASE ** attempt
+                logging.warning(
+                    "eth_getLogs [%d,%d] 失败，%ds 后重试 (%d/%d)",
+                    from_block, to_block, wait, attempt, MAX_RETRIES,
+                )
+                time.sleep(wait)
+                continue
+            return result
+        logging.error("eth_getLogs 多次重试失败，跳过区间 [%d,%d]", from_block, to_block)
+        return []
+
+    def call_decimals(self, token_address: str) -> Optional[int]:
+        """调用 ERC20 decimals()，返回 uint8。失败返回 None。"""
+        params = [{
+            "to": token_address,
+            "data": DECIMALS_SELECTOR,
+        }, "latest"]
+        result = self._call("eth_call", params)
+        if result is None or result in ("0x", "0x0"):
+            return None
+        try:
+            return int(result, 16)
+        except ValueError:
+            logging.error("解析 decimals 失败 raw=%s", result)
+            return None
+
+
+def init_rpc(rpc_url: str) -> EthRpcClient:
+    """初始化 RPC 客户端并校验连接。失败直接退出。"""
+    client = EthRpcClient(rpc_url)
+    if not client.is_connected():
         raise ConnectionError(f"无法连接 RPC 节点: {rpc_url}")
-    return w3
+    return client
 
 
-def get_token_decimals(w3: Web3, token_address: str, fallback: int) -> int:
+def get_token_decimals(rpc: EthRpcClient, token_address: str, fallback: int) -> int:
     """读取代币合约 decimals()。若调用失败则使用 fallback。"""
     if fallback and fallback > 0:
         return fallback
-    # erc20 ABI 片段：仅 decimals()
-    abi = [{"constant": True, "inputs": [], "name": "decimals",
-            "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"}]
-    try:
-        contract = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=abi)
-        return int(contract.functions.decimals().call())
-    except Exception as e:  # noqa: BLE001
-        logging.exception("读取 decimals() 失败，使用 fallback=%d: %s", fallback, e)
-        return fallback if fallback > 0 else 18
+    decimals = rpc.call_decimals(token_address)
+    if decimals is not None:
+        return decimals
+    logging.warning("读取 decimals() 失败，使用 fallback=%d", fallback)
+    return fallback if fallback > 0 else 18
 
 
 def fetch_transfer_logs(
-    w3: Web3, token_address: str, from_block: int, to_block: int
+    rpc: EthRpcClient, token_address: str, from_block: int, to_block: int
 ) -> List[Dict[str, Any]]:
     """拉取 [from_block, to_block] 区间内该代币的 Transfer 事件日志。"""
-    checksum_addr = Web3.to_checksum_address(token_address)
-    # topics[0] = Transfer 事件签名，address = 仅过滤该代币合约发出的事件
-    log_filter = {
-        "fromBlock": from_block,
-        "toBlock": to_block,
-        "address": checksum_addr,
-        "topics": [TRANSFER_EVENT_TOPIC],
-    }
-    # get_logs 偶发会因 RPC 节点限制 (block range / payload) 失败，外层重试
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            return w3.eth.get_logs(log_filter)
-        except Exception as e:  # noqa: BLE001
-            wait = RETRY_BACKOFF_BASE ** attempt
-            logging.warning(
-                "eth_get_logs 失败 [%d,%d]: %s，%ds 后重试 (%d/%d)",
-                from_block, to_block, e, wait, attempt, MAX_RETRIES,
-            )
-            time.sleep(wait)
-    logging.error("eth_get_logs 多次重试失败，跳过区间 [%d,%d]", from_block, to_block)
-    return []
+    return rpc.get_logs(from_block, to_block, token_address, [TRANSFER_EVENT_TOPIC])
 
 
 def _topic_to_address(topic: Any) -> str:
     """从 32 字节 indexed topic 中提取 20 字节地址，统一返回小写 0x 前缀。
-    兼容 web3.py 返回的 HexBytes（bytes）与 hex 字符串两种形态。
+
+    JSON-RPC 返回的 topics 是 hex 字符串（如 "0x000...000abcd"），
+    左侧补零到 66 字符，地址在最后 40 个 hex 字符。
     """
-    if isinstance(topic, (bytes, bytearray)):
-        hex_str = topic.hex()
-    else:
-        hex_str = topic[2:] if str(topic).startswith("0x") else str(topic)
+    hex_str = str(topic)
+    # 去掉 0x 前缀，取最后 40 个字符（20 字节地址）
+    if hex_str.startswith("0x"):
+        hex_str = hex_str[2:]
     return "0x" + hex_str[-40:].lower()
 
 
 def parse_transfer_log(log: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """解析单条 Transfer 事件日志。
     返回 {tx_hash, block, from, to, raw_value}，解析失败返回 None。
+
+    JSON-RPC 返回的 log 字段：
+      - address: 合约地址
+      - topics: [event_topic, from_topic, to_topic]  (hex 字符串)
+      - data: uint256 数量 (hex 字符串，66 字符含 0x)
+      - transactionHash: tx hash (hex)
+      - blockNumber: 区块号 (hex)
+      - logIndex: 日志序号 (hex)
     """
     try:
         topics = log.get("topics") or []
         if len(topics) < 3:
             return None
-        # topics[0] = Transfer 事件签名
-        # topics[1] = from（address 左侧补零到 32 字节）
-        # topics[2] = to
         from_addr = _topic_to_address(topics[1])
         to_addr = _topic_to_address(topics[2])
-        # data = uint256 数量（32 字节，无 indexed 字段）
-        data = log.get("data", "0x")
-        if isinstance(data, (bytes, bytearray)):
-            raw_value = int.from_bytes(data, byteorder="big")
+
+        # data = uint256 数量（hex 字符串）
+        data_str = (log.get("data") or "0x").strip()
+        if data_str in ("", "0x", "0X"):
+            raw_value = 0
         else:
-            # 字符串形态："0x" 或空串视为 0，避免 int("0x",16) 抛错
-            data_str = data.strip()
-            if data_str in ("", "0x", "0X"):
-                raw_value = 0
-            else:
-                raw_value = int(data_str, 16)
+            raw_value = int(data_str, 16)
+
         tx_hash = log.get("transactionHash")
-        if isinstance(tx_hash, (bytes, bytearray)):
-            tx_hash = "0x" + tx_hash.hex()
-        elif isinstance(tx_hash, str) and not tx_hash.startswith("0x"):
-            tx_hash = "0x" + tx_hash
-        block = int(log.get("blockNumber"))
-        log_index = int(log.get("logIndex"))
+        if tx_hash and not str(tx_hash).startswith("0x"):
+            tx_hash = "0x" + str(tx_hash)
+        block = int(log.get("blockNumber", "0x0"), 16)
+        log_index = int(log.get("logIndex", "0x0"), 16)
+
         return {
             "tx_hash": tx_hash,
             "block": block,
@@ -609,11 +675,11 @@ class TransferMonitor:
         self._init_logging(self.config.get("log_file", "alerts.log"))
 
         # 核心组件
-        self.w3 = init_web3(self.config["rpc_url"])
+        self.rpc = init_rpc(self.config["rpc_url"])
         self.chain = self.config.get("chain", "ethereum").lower()
         self.token_address = self.config["token_contract"].lower()
         self.decimals = get_token_decimals(
-            self.w3, self.token_address, int(self.config.get("token_decimals", 0))
+            self.rpc, self.token_address, int(self.config.get("token_decimals", 0))
         )
         self.symbol = self.config.get("token_symbol", "TOKEN")
         self.alert_threshold = float(self.config["alert_usd_threshold"])
@@ -713,18 +779,22 @@ class TransferMonitor:
         logging.info("触发告警 tx=%s usd=%.2f to_exchange=%s",
                      tx_hash, usd_value, to_label or "N/A")
 
-        # 推送飞书
-        ok = send_feishu_alert(self.feishu_webhook, title, lines, tx_link)
-        # 无论推送是否成功都标记已告警，防止失败时无限重推刷屏
-        # （若希望失败重推可改为仅在 ok=True 时标记）
-        self._mark_alerted(tx_hash)
-        if not ok:
-            logging.error("飞书推送失败但已标记 tx=%s，需人工核查 alerts.log", tx_hash)
+        # 推送飞书（未配置 webhook 时跳过，仅记日志）
+        if self.feishu_webhook:
+            ok = send_feishu_alert(self.feishu_webhook, title, lines, tx_link)
+            # 无论推送是否成功都标记已告警，防止失败时无限重推刷屏
+            # （若希望失败重推可改为仅在 ok=True 时标记）
+            self._mark_alerted(tx_hash)
+            if not ok:
+                logging.error("飞书推送失败但已标记 tx=%s，需人工核查 alerts.log", tx_hash)
+        else:
+            logging.info("未配置飞书 webhook，跳过推送 tx=%s（已标记为已告警）", tx_hash)
+            self._mark_alerted(tx_hash)
 
     # ---- 区间处理 ----
     def _process_range(self, from_block: int, to_block: int) -> None:
         logging.info("处理区块区间 [%d, %d]", from_block, to_block)
-        logs = fetch_transfer_logs(self.w3, self.token_address, from_block, to_block)
+        logs = fetch_transfer_logs(self.rpc, self.token_address, from_block, to_block)
         if not logs:
             return
         logging.info("区间内 Transfer 事件数: %d", len(logs))
@@ -743,7 +813,7 @@ class TransferMonitor:
         logging.info("监控器启动。轮询间隔 %ds，确认区块 %d",
                      self.poll_interval, self.confirmations)
         # 首次启动若状态为 0，则从 (当前块 - 确认数) 开始，避免从头扫描全链
-        latest = self.w3.eth.block_number
+        latest = self.rpc.block_number()
         if self.state["last_processed_block"] == 0:
             self.state["last_processed_block"] = max(0, latest - self.confirmations)
             logging.info("首次启动，从区块 %d 开始", self.state["last_processed_block"])
@@ -754,7 +824,7 @@ class TransferMonitor:
                 # 定期刷新交易所标签库（超过 refresh_interval 才真正发起请求）
                 self.exchanges.maybe_refresh()
 
-                latest = self.w3.eth.block_number
+                latest = self.rpc.block_number()
                 safe_block = latest - self.confirmations
                 last = self.state["last_processed_block"]
                 if safe_block > last:
