@@ -138,6 +138,64 @@ SENSITIVE_ENV_MAP = {
 }
 
 
+def _parse_tokens(cfg: Dict[str, Any], rpc: Optional[EthRpcClient] = None) -> List[Dict[str, Any]]:
+    """从 config 提取代币列表，兼容两种配置方式。
+
+    方式 A（新，推荐）: "tokens": [{contract, decimals, symbol, coingecko_id, alert_usd_threshold?}, ...]
+    方式 B（旧，单代币）: token_contract + token_decimals + token_symbol + coingecko_id
+
+    每种代币返回标准化 dict：
+        {contract, decimals, symbol, coingecko_id, alert_threshold, dust_threshold}
+    """
+    if cfg.get("tokens") and isinstance(cfg["tokens"], list):
+        raw_tokens = cfg["tokens"]
+    else:
+        # 向后兼容：把单代币字段转为 tokens 列表
+        if not cfg.get("token_contract"):
+            raise ValueError("未配置 tokens[] 或 token_contract，请在 config.json 至少提供一种")
+        raw_tokens = [{
+            "contract": cfg["token_contract"],
+            "decimals": cfg.get("token_decimals", 0),
+            "symbol": cfg.get("token_symbol", "TOKEN"),
+            "coingecko_id": cfg.get("coingecko_id", ""),
+        }]
+
+    tokens: List[Dict[str, Any]] = []
+    global_alert = float(cfg.get("alert_usd_threshold", 100_000))
+    global_dust = float(cfg.get("dust_usd_threshold", 100))
+
+    for t in raw_tokens:
+        contract = str(t.get("contract") or t.get("token_contract") or "").lower()
+        if not contract.startswith("0x"):
+            raise ValueError(f"代币合约地址无效: {t}")
+        decimals = int(t.get("decimals", 0))
+        # 若 decimals=0 且有 rpc，则自动获取；否则用 fallback=18
+        if decimals == 0 and rpc is not None:
+            decimals = get_token_decimals(rpc, contract, fallback=18)
+        elif decimals == 0:
+            decimals = 18  # 先占位，init 阶段再用 rpc 覆盖
+        symbol = str(t.get("symbol") or "TOKEN")
+        coin_id = str(t.get("coingecko_id") or t.get("coin_id") or "")
+        alert_th = float(t.get("alert_usd_threshold") or t.get("alert_threshold") or global_alert)
+        dust_th = float(t.get("dust_usd_threshold") or t.get("dust_threshold") or global_dust)
+
+        tokens.append({
+            "contract": contract,
+            "decimals": decimals,
+            "symbol": symbol,
+            "coingecko_id": coin_id,
+            "alert_threshold": alert_th,
+            "dust_threshold": dust_th,
+        })
+
+    if not tokens:
+        raise ValueError("代币列表为空，请在 config.json 的 tokens[] 中至少配置一个代币")
+
+    logging.info("解析代币配置: %d 个 [%s]", len(tokens),
+                 ", ".join(f"{t['symbol']}@{t['contract'][:10]}..." for t in tokens))
+    return tokens
+
+
 def load_config(path: str) -> Dict[str, Any]:
     """读取 JSON 配置文件，并用 .env / 环境变量覆盖敏感字段。
 
@@ -160,9 +218,14 @@ def load_config(path: str) -> Dict[str, Any]:
             cfg[cfg_key] = env_val.strip()
 
     # 3) 基本校验
-    required = ["rpc_url", "token_contract", "coingecko_id"]
+    required = ["rpc_url"]
+    # 代币配置二选一：tokens[] 或 token_contract
+    has_tokens_array = isinstance(cfg.get("tokens"), list) and len(cfg["tokens"]) > 0
+    has_single = bool(cfg.get("token_contract"))
+    if not has_tokens_array and not has_single:
+        required.extend(["tokens (数组)" , "token_contract (单代币)"])
     for key in required:
-        if not cfg.get(key):
+        if isinstance(key, str) and not cfg.get(key):
             raise ValueError(
                 f"配置项 {key} 不能为空。请在 config.json 中填写，或在 .env / 环境变量 "
                 f"{SENSITIVE_ENV_MAP.get(key, key.upper())} 中设置。"
@@ -390,53 +453,77 @@ def http_request_with_retry(
 # ------------------------------------------------------------------
 
 class PriceOracle:
-    """从 CoinGecko 获取代币 USD 价格，带 TTL 缓存。"""
+    """从 CoinGecko 获取多代币 USD 价格，批量拉取 + TTL 缓存。
 
-    def __init__(self, coin_id: str, api_key: str, ttl_seconds: int):
-        self.coin_id = coin_id
+    CoinGecko simple/price 端点支持 ids=id1,id2,id3 批量查询，比逐个请求高效得多。
+    内部维护 {coin_id: price} 字典，按统一 TTL 刷新。
+    """
+
+    def __init__(self, coin_ids: List[str], api_key: str, ttl_seconds: int):
+        # 去重并过滤空值
+        self.coin_ids: List[str] = list(dict.fromkeys(
+            cid.strip() for cid in coin_ids if cid and cid.strip()
+        ))
         self.api_key = api_key.strip() if api_key else ""
         self.ttl = max(ttl_seconds, 10)
-        self._price: Optional[float] = None
+        self._prices: Dict[str, Optional[float]] = {cid: None for cid in self.coin_ids}
         self._fetched_at: float = 0.0
 
-    def get_price_usd(self) -> Optional[float]:
-        """返回 USD 单价。获取失败返回 None（调用方据此跳过告警或使用上次缓存）。"""
-        now = time.time()
-        if self._price is not None and (now - self._fetched_at) < self.ttl:
-            return self._price
-
+    def _fetch(self) -> None:
+        """批量拉取所有 coin_id 的 USD 价格，失败时保持旧缓存。"""
+        if not self.coin_ids:
+            return
         headers = {"accept": "application/json"}
-        # Demo / Pro key 通过 header 传递（免费版留空即可）
         if self.api_key:
             headers["x-cg-demo-api-key"] = self.api_key
 
-        params = {"ids": self.coin_id, "vs_currencies": "usd"}
+        params = {"ids": ",".join(self.coin_ids), "vs_currencies": "usd"}
         resp = http_request_with_retry(
             "GET", COINGECKO_PRICE_URL,
-            headers=headers, params=params, timeout=10,
+            headers=headers, params=params, timeout=15,
         )
         if resp is None or resp.status_code != 200:
             logging.error(
-                "CoinGecko 价格获取失败 status=%s body=%s",
+                "CoinGecko 批量价格获取失败 status=%s body=%s",
                 getattr(resp, "status_code", None),
                 getattr(resp, "text", None)[:200],
             )
-            # 失败时若有旧缓存继续用，否则返回 None
-            return self._price
+            return
 
         try:
             data = resp.json()
-            price = data.get(self.coin_id, {}).get("usd")
-            if price is None:
-                logging.error("CoinGecko 返回缺少 %s.usd 字段: %s", self.coin_id, data)
-                return self._price
-            self._price = float(price)
-            self._fetched_at = now
-            logging.info("代币价格刷新: 1 %s = %.6f USD", self.coin_id, self._price)
-            return self._price
+            now = time.time()
+            fetched_any = False
+            for cid in self.coin_ids:
+                price_data = data.get(cid)
+                price_val = price_data.get("usd") if isinstance(price_data, dict) else None
+                if price_val is not None:
+                    self._prices[cid] = float(price_val)
+                    fetched_any = True
+                else:
+                    # CoinGecko 返回的 coin_id 无 usd 字段：保持旧值或 None
+                    if self._prices.get(cid) is None:
+                        logging.warning("CoinGecko 未返回 %s.usd 字段（代币可能无 USD 价格）", cid)
+            if fetched_any:
+                self._fetched_at = now
+                logging.info("代币价格刷新: %s",
+                             ", ".join(f"{cid}=${self._prices[cid]:,.6f}"
+                                       for cid in self.coin_ids
+                                       if self._prices.get(cid) is not None))
         except (ValueError, KeyError, TypeError) as e:
-            logging.exception("CoinGecko 价格解析失败: %s", e)
-            return self._price
+            logging.exception("CoinGecko 批量价格解析失败: %s", e)
+
+    def get_price_usd(self, coin_id: str) -> Optional[float]:
+        """返回指定 coin_id 的 USD 单价。缓存过期则批量刷新全部。"""
+        if coin_id not in self._prices:
+            # 动态新增（理论上不会，tokens 初始化时已全部覆盖）
+            self._prices[coin_id] = None
+
+        now = time.time()
+        if (now - self._fetched_at) >= self.ttl:
+            self._fetch()
+
+        return self._prices.get(coin_id)
 
 
 # ------------------------------------------------------------------
@@ -547,10 +634,20 @@ def get_token_decimals(rpc: EthRpcClient, token_address: str, fallback: int) -> 
 
 
 def fetch_transfer_logs(
-    rpc: EthRpcClient, token_address: str, from_block: int, to_block: int
+    rpc: EthRpcClient, token_addresses: List[str], from_block: int, to_block: int
 ) -> List[Dict[str, Any]]:
-    """拉取 [from_block, to_block] 区间内该代币的 Transfer 事件日志。"""
-    return rpc.get_logs(from_block, to_block, token_address, [TRANSFER_EVENT_TOPIC])
+    """拉取 [from_block, to_block] 区间内多个代币合约的 Transfer 事件日志。
+
+    JSON-RPC 一次 eth_getLogs 可传 address 数组: ["0xaaa...", "0xbbb..."]，
+    比分别调用更高效。返回的每条 log 自带 address 字段，可区分是哪个代币。
+    """
+    if not token_addresses:
+        return []
+    if len(token_addresses) == 1:
+        # 单合约时直接传字符串（部分 RPC 节点对数组兼容性差）
+        return rpc.get_logs(from_block, to_block, token_addresses[0], [TRANSFER_EVENT_TOPIC])
+    else:
+        return rpc.get_logs(from_block, to_block, token_addresses, [TRANSFER_EVENT_TOPIC])
 
 
 def _topic_to_address(topic: Any) -> str:
@@ -718,23 +815,35 @@ class TransferMonitor:
         # 核心组件
         self.rpc = init_rpc(self.config["rpc_url"])
         self.chain = self.config.get("chain", "ethereum").lower()
-        self.token_address = self.config["token_contract"].lower()
-        self.decimals = get_token_decimals(
-            self.rpc, self.token_address, int(self.config.get("token_decimals", 0))
-        )
-        self.symbol = self.config.get("token_symbol", "TOKEN")
-        self.alert_threshold = float(self.config["alert_usd_threshold"])
-        self.dust_threshold = float(self.config.get("dust_usd_threshold", 0))
+        self.alert_threshold = float(self.config.get("alert_usd_threshold", 100_000))
+        self.dust_threshold = float(self.config.get("dust_usd_threshold", 100))
         self.confirmations = int(self.config.get("confirmations", 6))
         self.poll_interval = int(self.config.get("poll_interval_seconds", 12))
 
+        # 解析代币列表（兼容 tokens[] 数组 / 单代币字段）
+        # 先占位 decimals=0，init 阶段用 rpc 覆盖
+        self.tokens = _parse_tokens(self.config, rpc=None)
+        # 用 rpc 修正 decimals（若 config 填了 0）
+        for t in self.tokens:
+            if t["decimals"] == 0:
+                t["decimals"] = get_token_decimals(
+                    self.rpc, t["contract"], fallback=18
+                )
+
+        # 构建合约地址 → 代币信息 映射（从 log.address 反查是哪个代币）
+        self._contract_to_token: Dict[str, Dict[str, Any]] = {
+            t["contract"]: t for t in self.tokens
+        }
+
+        # PriceOracle 批量拉取所有 coin_id（更高效）
+        all_coin_ids = [t["coingecko_id"] for t in self.tokens if t["coingecko_id"]]
         self.price_oracle = PriceOracle(
-            coin_id=self.config["coingecko_id"],
+            coin_ids=all_coin_ids,
             api_key=self.config.get("coingecko_api_key", ""),
             ttl_seconds=int(self.config.get("price_cache_ttl_seconds", 60)),
         )
 
-        # 交易所标签库：支持从外部 URL 定期拉取 + 本地兜底
+        # 交易所标签库
         self.exchanges = ExchangeLabelStore(
             url=self.config.get("exchanges_url"),
             local_path=self.config.get("exchanges_file", "exchanges.json"),
@@ -742,14 +851,21 @@ class TransferMonitor:
         )
         self.exchanges.init()
         self.state = load_state(self.config.get("state_file", "monitor_state.json"))
-        self.feishu_webhook = self.config["feishu_webhook_url"]
+        self.feishu_webhook = self.config.get("feishu_webhook_url", "")
         self.feishu_webhook_secret = self.config.get("feishu_webhook_secret") or None
         self.tx_link_prefix = EXPLORER_TX_PREFIX.get(self.chain, EXPLORER_TX_PREFIX["ethereum"])
 
+        # 打印初始化摘要
         logging.info(
-            "监控器初始化完成: chain=%s token=%s decimals=%d threshold=%.2f USD confirmations=%d",
-            self.chain, self.token_address, self.decimals, self.alert_threshold, self.confirmations,
+            "监控器初始化完成: chain=%s tokens=%d confirmations=%d",
+            self.chain, len(self.tokens), self.confirmations,
         )
+        for t in self.tokens:
+            logging.info(
+                "  - %s: contract=%s decimals=%d coingecko_id=%s threshold=$%.2f",
+                t["symbol"], t["contract"][:12] + "...", t["decimals"],
+                t["coingecko_id"] or "(无)", t["alert_threshold"],
+            )
 
     # ---- 日志 ----
     def _init_logging(self, log_file: str) -> None:
@@ -777,26 +893,36 @@ class TransferMonitor:
             self.state["alerted_txs"] = dict(sorted_items[-10000:])
 
     # ---- 单笔转账处理 ----
-    def _handle_transfer(self, t: Dict[str, Any]) -> None:
+    def _handle_transfer(self, t: Dict[str, Any], token_info: Dict[str, Any]) -> None:
+        """处理单笔转账。
+
+        Args:
+            t: parse_transfer_log 的返回值
+            token_info: 该代币的标准化配置 dict（含 contract / decimals / symbol / coingecko_id / alert_threshold / dust_threshold）
+        """
         tx_hash = t["tx_hash"]
         # 防重复告警
         if self._already_alerted(tx_hash):
             return
 
         # 数量与 USD 价值
-        amount = t["raw_value"] / (10 ** self.decimals)
-        price = self.price_oracle.get_price_usd()
+        amount = t["raw_value"] / (10 ** token_info["decimals"])
+        coin_id = token_info.get("coingecko_id", "")
+        price = self.price_oracle.get_price_usd(coin_id) if coin_id else None
         if price is None:
             # 价格获取失败时跳过本轮（下一轮还会重新拉到，因为有去重所以不会漏）
-            logging.warning("价格不可用，跳过 tx=%s，下一轮重试", tx_hash)
+            # 若无 coingecko_id（可能是无价格的新币），也跳过 USD 换算告警
+            if coin_id:
+                logging.warning("价格不可用 %s，跳过 tx=%s，下一轮重试", token_info["symbol"], tx_hash)
             return
         usd_value = amount * price
 
-        # 灰尘过滤
-        if usd_value < self.dust_threshold:
+        # 灰尘过滤（用代币自己的 dust_threshold，回退全局）
+        dust_th = token_info.get("dust_threshold") or self.dust_threshold
+        alert_th = token_info.get("alert_threshold") or self.alert_threshold
+        if usd_value < dust_th:
             return
-        # 阈值过滤
-        if usd_value < self.alert_threshold:
+        if usd_value < alert_th:
             return
 
         # 交易所识别
@@ -805,9 +931,10 @@ class TransferMonitor:
 
         # 组装告警消息
         tx_link = self.tx_link_prefix + tx_hash
-        title = f"大额 {self.symbol} 转账告警 ${usd_value:,.2f}"
+        symbol = token_info["symbol"]
+        title = f"大额 {symbol} 转账 ${usd_value:,.2f}"
         lines = [
-            f"**代币**: {self.symbol}",
+            f"**代币**: {symbol}",
             f"**数量**: {amount:,.4f}",
             f"**USD 价值**: ${usd_value:,.2f}",
             f"**发送方**: `{t['from']}`" + (f" ({from_label})" if from_label else ""),
@@ -818,8 +945,8 @@ class TransferMonitor:
         if to_label:
             lines.insert(0, f"⚠️ 接收方为交易所: **{to_label}**")
 
-        logging.info("触发告警 tx=%s usd=%.2f to_exchange=%s",
-                     tx_hash, usd_value, to_label or "N/A")
+        logging.info("触发告警 [%s] tx=%s usd=%.2f to_exchange=%s",
+                     symbol, tx_hash, usd_value, to_label or "N/A")
 
         # 推送飞书（未配置 webhook 时跳过，仅记日志）
         if self.feishu_webhook:
@@ -828,18 +955,18 @@ class TransferMonitor:
                 secret=self.feishu_webhook_secret,
             )
             # 无论推送是否成功都标记已告警，防止失败时无限重推刷屏
-            # （若希望失败重推可改为仅在 ok=True 时标记）
             self._mark_alerted(tx_hash)
             if not ok:
-                logging.error("飞书推送失败但已标记 tx=%s，需人工核查 alerts.log", tx_hash)
+                logging.error("飞书推送失败但已标记 [%s] tx=%s，需人工核查 alerts.log", symbol, tx_hash)
         else:
-            logging.info("未配置飞书 webhook，跳过推送 tx=%s（已标记为已告警）", tx_hash)
+            logging.info("未配置飞书 webhook，跳过推送 [%s] tx=%s（已标记为已告警）", symbol, tx_hash)
             self._mark_alerted(tx_hash)
 
     # ---- 区间处理 ----
     def _process_range(self, from_block: int, to_block: int) -> None:
         logging.info("处理区块区间 [%d, %d]", from_block, to_block)
-        logs = fetch_transfer_logs(self.rpc, self.token_address, from_block, to_block)
+        all_contracts = [t["contract"] for t in self.tokens]
+        logs = fetch_transfer_logs(self.rpc, all_contracts, from_block, to_block)
         if not logs:
             return
         logging.info("区间内 Transfer 事件数: %d", len(logs))
@@ -847,8 +974,15 @@ class TransferMonitor:
             parsed = parse_transfer_log(log)
             if parsed is None:
                 continue
+            # 从 log.address 反查是哪个代币
+            contract_addr = str(log.get("address", "")).lower()
+            token_info = self._contract_to_token.get(contract_addr)
+            if token_info is None:
+                # 不应该发生，eth_getLogs 只返回指定 address 的日志
+                logging.warning("Transfer 日志来自未监控合约: %s", contract_addr)
+                continue
             try:
-                self._handle_transfer(parsed)
+                self._handle_transfer(parsed, token_info)
             except Exception as e:  # noqa: BLE001  单笔异常不影响整体
                 logging.exception("处理单笔转账异常 tx=%s: %s",
                                   parsed.get("tx_hash"), e)

@@ -2,28 +2,44 @@
   "_comment_rpc": "RPC 节点 URL。敏感字段，推荐放 .env 的 RPC_URL；此处留空时由 .env / 环境变量覆盖。Alchemy / Infura / Ankr 只读节点即可，无需私钥。",
   "rpc_url": "",
 
-  "_comment_chain": "链类型，决定浏览器前缀与原生货币。支持: ethereum / bsc / polygon / arbitrum / optimism / base",
+  "_comment_chain": "链类型，决定浏览器前缀与原生货币。支持: ethereum / bsc / polygon / arbitrum / optimism / base / avalanche",
   "chain": "ethereum",
 
-  "_comment_token": "要监控的 ERC20 代币合约地址",
+  "_comment_tokens_primary": "【推荐】多代币监控数组。若 tokens[] 非空则优先使用；否则回退到下方单代币字段（向后兼容）。",
+  "tokens": [
+    {
+      "_comment": "USDT 稳定币",
+      "contract": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+      "decimals": 6,
+      "symbol": "USDT",
+      "coingecko_id": "tether",
+      "alert_usd_threshold": 100000,
+      "dust_usd_threshold": 100
+    },
+    {
+      "_comment": "USDC 稳定币（示例，可按需增删）",
+      "contract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "decimals": 6,
+      "symbol": "USDC",
+      "coingecko_id": "usd-coin",
+      "alert_usd_threshold": 100000,
+      "dust_usd_threshold": 100
+    }
+  ],
+
+  "_comment_tokens_alt": "【兼容旧配置】单代币字段。当 tokens[] 为空时使用。新配置请用上面的 tokens[] 数组。",
   "token_contract": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
-
-  "_comment_token_decimals": "代币精度。若填 0 则自动调用合约 decimals() 获取",
   "token_decimals": 6,
-
-  "_comment_token_symbol": "代币符号，用于告警消息展示",
   "token_symbol": "USDT",
-
-  "_comment_coingecko_id": "CoinGecko 对应 coin_id，用于查询 USD 价格。例: tether / usd-coin / wrapped-bitcoin。在 coingecko.com 搜索代币后从 URL 获取",
   "coingecko_id": "tether",
 
   "_comment_coingecko_key": "CoinGecko API key（可选，敏感）。推荐放 .env 的 COINGECKO_API_KEY；免费版留空即可，限流约 30 次/分钟。Pro key 见 https://www.coingecko.com/api/pricing",
   "coingecko_api_key": "",
 
-  "_comment_alert_usd": "USD 告警阈值，单笔转账折算 USD 超过此值才告警",
+  "_comment_alert_usd": "全局 USD 告警阈值（当 tokens[] 中未单独指定 alert_usd_threshold 时使用此值）",
   "alert_usd_threshold": 100000,
 
-  "_comment_dust_usd": "USD 灰尘阈值，低于此值的转账直接忽略（减少日志噪声）",
+  "_comment_dust_usd": "全局 USD 灰尘阈值（当 tokens[] 中未单独指定 dust_usd_threshold 时使用此值）",
   "dust_usd_threshold": 100,
 
   "_comment_confirmations": "确认区块数，等待 N 个区块后再处理，降低因链重组导致漏单/重复的风险",
@@ -32,7 +48,7 @@
   "_comment_poll_interval": "轮询间隔（秒）。建议 10~15 秒，避免触发 RPC 限流",
   "poll_interval_seconds": 12,
 
-  "_comment_price_ttl": "代币价格缓存时长（秒），避免高频请求 CoinGecko 被限流",
+  "_comment_price_ttl": "代币价格缓存时长（秒），避免高频请求 CoinGecko 被限流。多代币批量拉取更高效",
   "price_cache_ttl_seconds": 60,
 
   "_comment_feishu": "飞书自定义机器人 webhook URL。敏感字段，推荐放 .env 的 FEISHU_WEBHOOK_URL；此处留空时由 .env / 环境变量覆盖。在飞书群聊添加'自定义机器人'后复制此地址",
