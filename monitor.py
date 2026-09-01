@@ -178,6 +178,7 @@ def _parse_tokens(cfg: Dict[str, Any], rpc: Optional[EthRpcClient] = None) -> Li
         coin_id = str(t.get("coingecko_id") or t.get("coin_id") or "")
         alert_th = float(t.get("alert_usd_threshold") or t.get("alert_threshold") or global_alert)
         dust_th = float(t.get("dust_usd_threshold") or t.get("dust_threshold") or global_dust)
+        skip_alert = bool(t.get("skip_alert", False))
 
         tokens.append({
             "contract": contract,
@@ -186,6 +187,7 @@ def _parse_tokens(cfg: Dict[str, Any], rpc: Optional[EthRpcClient] = None) -> Li
             "coingecko_id": coin_id,
             "alert_threshold": alert_th,
             "dust_threshold": dust_th,
+            "skip_alert": skip_alert,
         })
 
     if not tokens:
@@ -923,6 +925,12 @@ class TransferMonitor:
         if usd_value < dust_th:
             return
         if usd_value < alert_th:
+            return
+
+        # 若该代币标记了 skip_alert，仅记录金额到日志，不推送飞书也不标记已告警
+        if token_info.get("skip_alert"):
+            logging.info("[SKIP_ALERT] %s tx=%s usd=%.2f 达到阈值但配置了跳过告警",
+                         token_info["symbol"], tx_hash, usd_value)
             return
 
         # 交易所识别
