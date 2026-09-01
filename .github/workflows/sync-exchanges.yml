@@ -1,0 +1,84 @@
+# ============================================================
+# 交易所地址标签库自动同步  ——  每日定时从外部源拉取并 commit
+# ============================================================
+# 触发：
+#   - 定时：每日 UTC 02:00（北京时间 10:00）
+#   - 手动：Actions 页面点 "Run workflow"
+# 权限：使用默认 GITHUB_TOKEN，需在仓库 Settings -> Actions -> General ->
+#       Workflow permissions 勾选 "Read and write permissions"
+# 产物：exchanges.json 被更新并推回 main（仅在有变更时 commit）
+#
+# 数据流：
+#   远程 CSV (DataDr69 CEX)  ──csv_to_labels.py──▶  cex_labels.json (本地)
+#   远程 JSON (VHRanger)     ─────────────────────┐
+#   本地 cex_labels.json     ──────────────────────┴─▶ sync_exchanges.py ──▶ exchanges.json
+#   （sources.json 同时引用 JSON URL 与本地 CSV 转换产物）
+
+name: Sync Exchange Labels
+
+on:
+  schedule:
+    # 每日 UTC 02:00 运行
+    - cron: "0 2 * * *"
+  workflow_dispatch: {}   # 允许手动触发
+
+permissions:
+  contents: write         # 允许 commit 推送
+
+concurrency:
+  group: sync-exchange-labels
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 检出代码（fetch-depth: 0 便于 diff / commit）
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Python 环境（sync_exchanges.py 依赖 requests；csv_to_labels.py 仅标准库）
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: pip install requests
+
+      # 3. 准备 sources.json：若不存在则用 sources.example.json
+      - name: Prepare sources config
+        run: |
+          if [ ! -f sources.json ]; then
+            cp sources.example.json sources.json
+            echo "已从 sources.example.json 复制为 sources.json"
+          fi
+
+      # 4. CSV 转 JSON：把 DataDr69 CEX CSV 转为本地 JSON，供 sync_exchanges.py 作为源
+      #    csv_to_labels.py 仅依赖标准库，可直接下载远程 CSV 或读本地文件
+      #    sources.example.json 已把 cex_labels.json 列为本地源，故 sources.json 自动包含
+      - name: Convert CSV to JSON
+        run: |
+          python csv_to_labels.py \
+            -i https://raw.githubusercontent.com/DataDr69/labeled_ethereum_addresses_dataset/main/csv/01_cex_labels.csv \
+            -o cex_labels.json
+          echo "CSV 转换完成，地址数：$(python -c 'import json;print(len(json.load(open("cex_labels.json"))))')"
+
+      # 5. 运行同步脚本（合并 JSON URL 源 + 本地 CSV 转换产物）
+      - name: Run sync
+        run: python sync_exchanges.py --sources sources.json --out exchanges.json
+
+      # 6. 仅在 exchanges.json 有变更时 commit & push
+      #    exchanges.json 已加入 .gitignore，CI 用 -f 强制暂存以便推回仓库
+      - name: Commit changes if any
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f exchanges.json
+          if git diff --cached --quiet; then
+            echo "exchanges.json 无变更，跳过 commit"
+          else
+            git commit -m "chore(sync): update exchange address labels [skip ci]"
+            git push
+            echo "已推送更新"
+          fi

@@ -1,0 +1,72 @@
+# ============================================================
+# systemd 服务单元文件 —— ERC20 代币转账监控器（只读）
+# ============================================================
+# 安装步骤：
+#   1) sudo cp erc20-monitor.service /etc/systemd/system/erc20-monitor.service
+#   2) sudo cp erc20-monitor.env     /etc/systemd/system/erc20-monitor.env
+#      编辑后者填入 RPC_URL / FEISHU_WEBHOOK_URL / COINGECKO_API_KEY
+#   3) sudo systemctl daemon-reload
+#   4) sudo systemctl enable --now erc20-monitor
+#   5) journalctl -u erc20-monitor -f            # 实时日志
+#      sudo systemctl status erc20-monitor        # 状态
+#      sudo systemctl restart erc20-monitor       # 重启（如改了 config.json）
+#
+# 权限：服务以专用只读用户运行，仅能访问工作目录，无 sudo 权限。
+
+[Unit]
+Description=ERC20 Token Transfer Monitor (read-only on-chain)
+Documentation=file:///opt/erc20-monitor/monitor.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ---- 运行身份：专用无登录用户，最小权限 ----
+User=erc20mon
+Group=erc20mon
+
+# ---- 工作目录：程序与配置都放这里 ----
+WorkingDirectory=/opt/erc20-monitor
+
+# ---- 敏感配置通过 EnvironmentFile 注入（不写进 unit、不进日志）----
+# 文件权限建议 0600，属主 root:erc20mon
+EnvironmentFile=/etc/systemd/system/erc20-monitor.env
+
+# ---- 启动命令：config.json 也用绝对路径 ----
+ExecStart=/opt/erc20-monitor/venv/bin/python /opt/erc20-monitor/monitor.py /opt/erc20-monitor/config.json
+
+# ---- 进程管理：崩溃自动重启，指数退避，10s 内最多 5 次 ----
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# ---- 日志：交给 journald，可用 journalctl -u erc20-monitor 查看 ----
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=erc20-monitor
+
+# ---- 安全加固（程序本身只读，无需任何特权）----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/erc20-monitor
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RemoveIPC=true
+# 程序只发起出站 HTTPS，可收紧地址族与系统调用白名单
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# 资源限制（按需调整）
+MemoryMax=512M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

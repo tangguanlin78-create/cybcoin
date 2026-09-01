@@ -1,0 +1,34 @@
+# 敏感配置 —— 永不提交
+.env
+erc20-monitor.env
+config.json
+config.json.json
+
+# 运行时状态与日志
+monitor_state.json
+monitor_state.json.tmp
+alerts.log
+
+# 交易所标签库 —— 本地生成产物（由 sync_exchanges.py 产出，不跟踪）
+exchanges.json
+exchanges.json.tmp
+
+# 交易所标签库远程拉取的落地缓存
+exchanges.json.cache
+exchanges.json.cache.tmp
+
+# sync_exchanges.py 的本地 sources 配置（从 sources.example.json 复制）
+sources.json
+
+# csv_to_labels.py 产生的中间产物（CI 中生成，不提交）
+cex_labels.json
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+*.egg-info/
+
+# 本地安装的便携工具（沙箱内安装的 Git 等）
+.tools/

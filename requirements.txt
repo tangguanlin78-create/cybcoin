@@ -1,0 +1,11 @@
+# ERC20 代币转账监控程序依赖
+# 安装： pip install -r requirements.txt
+
+# Web3 - 与以太坊兼容链 RPC 交互（获取区块、解析事件日志）
+web3>=6.0.0,<7.0.0
+
+# requests - HTTP 客户端，用于调用飞书 webhook 与 CoinGecko 价格 API
+requests>=2.28.0
+
+# python-dotenv - 从 .env 文件加载敏感配置（webhook、rpc url 等）
+python-dotenv>=1.0.0

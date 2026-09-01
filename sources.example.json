@@ -1,0 +1,15 @@
+{
+  "_comment": "交易所标签库同步源列表。每项为 {name, url} 或纯 url 字符串。url 需返回 JSON（兼容三种格式，详见 sync_exchanges.py）。url 既可是 http(s) 远程地址，也可是本地文件路径（fetch_url 自动识别）。GitHub Actions 工作流会自动追加 csv_to_labels.py 产出的 cex_labels.json 作为本地源。",
+  "sources": [
+    {
+      "name": "VHRanger-tether-known-addresses",
+      "url": "https://raw.githubusercontent.com/VHRanger/tether/main/data/known_addresses.json",
+      "_note": "扁平 map 格式，混合多链（BTC/XRP/ETH）。脚本会自动过滤出 0x 开头 42 字符的 EVM 地址。约 54 个 EVM 地址，含 binance/coinbase/bitfinex/huobi/ftx 等标签。MIT 许可证。"
+    },
+    {
+      "name": "DataDr69-CEX-CSV",
+      "url": "cex_labels.json",
+      "_note": "本地文件，由 GitHub Actions 工作流中 csv_to_labels.py 从 DataDr69 CEX CSV 转换生成。本地手动运行需先执行：python csv_to_labels.py -i https://raw.githubusercontent.com/DataDr69/labeled_ethereum_addresses_dataset/main/csv/01_cex_labels.csv -o cex_labels.json。约 360 个 CEX 地址。"
+    }
+  ]
+}
