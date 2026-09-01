@@ -35,11 +35,11 @@ jobs:
     steps:
       # 1. 检出代码（fetch-depth: 0 便于 diff / commit）
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 2. Python 环境（sync_exchanges.py 依赖 requests；csv_to_labels.py 仅标准库）
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
