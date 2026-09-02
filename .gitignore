@@ -26,6 +26,10 @@ sources.json
 # csv_to_labels.py 产生的中间产物（CI 中生成，不提交）
 cex_labels.json
 
+# fetch_binance_perp_tokens.py 的输出数据（可重新生成，不提交）
+binance_perp_tokens.json
+binance_perp_tokens_preview.json
+
 # Python
 __pycache__/
 *.py[cod]
