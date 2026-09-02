@@ -137,6 +137,13 @@ SENSITIVE_ENV_MAP = {
     "coingecko_api_key": "COINGECKO_API_KEY",
 }
 
+# 路径类配置（state_file / log_file）也可通过环境变量覆盖，
+# 主要用于 Docker 部署：把状态文件指向挂载卷，保证容器重启后不丢失。
+PATH_ENV_MAP = {
+    "state_file": "STATE_FILE",
+    "log_file": "LOG_FILE",
+}
+
 
 def _parse_tokens(cfg: Dict[str, Any], rpc: Optional[EthRpcClient] = None) -> List[Dict[str, Any]]:
     """从 config 提取代币列表，兼容两种配置方式。
@@ -217,6 +224,11 @@ def load_config(path: str) -> Dict[str, Any]:
     for cfg_key, env_key in SENSITIVE_ENV_MAP.items():
         env_val = os.getenv(env_key)
         if env_val:  # 非空字符串才覆盖（空字符串视为未设置）
+            cfg[cfg_key] = env_val.strip()
+    # 路径类配置（state_file / log_file）同样支持环境变量覆盖
+    for cfg_key, env_key in PATH_ENV_MAP.items():
+        env_val = os.getenv(env_key)
+        if env_val:
             cfg[cfg_key] = env_val.strip()
 
     # 3) 基本校验
@@ -812,7 +824,8 @@ class TransferMonitor:
         self.config = load_config(config_path)
 
         # 日志先初始化，便于后续流程都有日志输出
-        self._init_logging(self.config.get("log_file", "alerts.log"))
+        self.log_file = self.config.get("log_file", "alerts.log")
+        self._init_logging(self.log_file)
 
         # 核心组件
         self.rpc = init_rpc(self.config["rpc_url"])
@@ -852,7 +865,9 @@ class TransferMonitor:
             refresh_interval_seconds=int(self.config.get("exchanges_refresh_seconds", 3600)),
         )
         self.exchanges.init()
-        self.state = load_state(self.config.get("state_file", "monitor_state.json"))
+        # 状态文件路径（提取为属性，避免循环里重复硬编码默认值）
+        self.state_file = self.config.get("state_file", "monitor_state.json")
+        self.state = load_state(self.state_file)
         self.feishu_webhook = self.config.get("feishu_webhook_url", "")
         self.feishu_webhook_secret = self.config.get("feishu_webhook_secret") or None
         self.tx_link_prefix = EXPLORER_TX_PREFIX.get(self.chain, EXPLORER_TX_PREFIX["ethereum"])
@@ -965,7 +980,7 @@ class TransferMonitor:
             # 无论推送是否成功都标记已告警，防止失败时无限重推刷屏
             self._mark_alerted(tx_hash)
             if not ok:
-                logging.error("飞书推送失败但已标记 [%s] tx=%s，需人工核查 alerts.log", symbol, tx_hash)
+                logging.error("飞书推送失败但已标记 [%s] tx=%s，需人工核查 %s", symbol, tx_hash, self.log_file)
         else:
             logging.info("未配置飞书 webhook，跳过推送 [%s] tx=%s（已标记为已告警）", symbol, tx_hash)
             self._mark_alerted(tx_hash)
@@ -1004,7 +1019,7 @@ class TransferMonitor:
         if self.state["last_processed_block"] == 0:
             self.state["last_processed_block"] = max(0, latest - self.confirmations)
             logging.info("首次启动，从区块 %d 开始", self.state["last_processed_block"])
-            save_state(self.config.get("state_file", "monitor_state.json"), self.state)
+            save_state(self.state_file, self.state)
 
         while True:
             try:
@@ -1019,7 +1034,7 @@ class TransferMonitor:
                     to_block = min(safe_block, last + 500)
                     self._process_range(last + 1, to_block)
                     self.state["last_processed_block"] = to_block
-                    save_state(self.config.get("state_file", "monitor_state.json"), self.state)
+                    save_state(self.state_file, self.state)
                 else:
                     # 没有新块，静默等待
                     pass

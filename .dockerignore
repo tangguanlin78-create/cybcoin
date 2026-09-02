@@ -1,0 +1,46 @@
+# Docker 构建时忽略的文件，减小 build context
+# Dockerfile 只 COPY 特定文件，但忽略以下内容可加速构建、避免敏感数据进镜像
+
+# Git / CI
+.git
+.github
+.gitignore
+
+# 敏感配置（绝不进镜像）
+.env
+.env.example
+config.json
+config.json.json
+erc20-monitor.env
+
+# 运行时状态（应通过 volume 持久化，不进镜像）
+monitor_state.json
+alerts.log
+*.cache
+data/
+
+# 交易所标签库产物（容器启动后会自己下载 / 从 volume 挂载）
+exchanges.json
+exchanges.json.tmp
+exchanges.json.cache
+cex_labels.json
+sources.json
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# 部署脚本（容器内不需要）
+deploy.sh
+update.sh
+uninstall.sh
+erc20-monitor.service
+test_feishu.py
+csv_to_labels.py
+sync_exchanges.py
+
+# 工具与文档
+.tools/
+*.md

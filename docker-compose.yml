@@ -1,0 +1,44 @@
+# ERC20 转账监控 —— Docker Compose 部署
+# 用法：
+#   1. 复制 .env.example -> .env，填写 RPC_URL / FEISHU_WEBHOOK_URL
+#   2. 复制 config.example.json -> config.json，填写代币 / 阈值
+#   3. （可选）python sync_exchanges.py 生成 exchanges.json
+#   4. docker compose up -d --build
+#   5. docker compose logs -f             查看实时日志
+#   6. docker compose restart              重启（改完 config 后）
+#   7. docker compose down                 停止并删除容器（data 卷保留）
+
+services:
+  erc20-monitor:
+    build: .
+    image: erc20-monitor:latest
+    container_name: erc20-monitor
+    restart: unless-stopped  # 崩溃自动重启，除非手动 stop
+
+    # 敏感配置从 .env 注入（RPC_URL / FEISHU_WEBHOOK_URL / FEISHU_WEBHOOK_SECRET）
+    env_file:
+      - .env
+
+    environment:
+      # 状态文件指向挂载卷，保证容器重启后不丢失已处理区块、不重复告警
+      - STATE_FILE=/data/monitor_state.json
+      - LOG_FILE=/data/alerts.log
+      - TZ=Asia/Shanghai
+
+    volumes:
+      # 持久化状态：已处理区块号、已告警 tx 哈希、告警日志
+      - ./data:/data
+      # 配置文件只读挂载，改完 config.json 后 docker compose restart 即生效
+      - ./config.json:/app/config.json:ro
+      # 交易所标签库可读写挂载（容器内可写 cache 文件，CI 更新后本地拉取即生效）
+      - ./exchanges.json:/app/exchanges.json
+
+    # 不暴露端口（纯后台轮询进程，无需访问）
+    # 日志走 stdout/stderr，docker compose logs 查看
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+# 单独命名卷可选，这里用 ./data 绑定挂载更直观（可随时查看文件）
