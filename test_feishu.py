@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 
 
 def feishu_sign(secret: str) -> tuple[str, str]:
-    """飞书签名算法（同 monitor.py _feishu_sign）"""
+    """飞书签名算法（同 all_coin_alarm.py _feishu_sign）"""
     timestamp = str(int(time.time()))
     string_to_sign = f"{timestamp}\n{secret}"
     hmac_code = hmac.new(
@@ -44,7 +44,7 @@ def send_card(webhook_url: str, secret: str | None) -> bool:
     content_lines = [
         f"**测试时间**: {now}",
         f"**签名校验**: {'启用 ✅' if secret else '未启用'}",
-        "**说明**: 这是一条来自 monitor.py 的连通性测试消息。",
+        "**说明**: 这是一条来自 all_coin_alarm.py 的连通性测试消息。",
     ]
 
     payload: dict = {

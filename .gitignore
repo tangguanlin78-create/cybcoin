@@ -8,6 +8,9 @@ config.json.json
 monitor_state.json
 monitor_state.json.tmp
 alerts.log
+monitor_state_v2.json
+monitor_state_v2.json.tmp
+alerts_v2.log
 
 # 交易所标签库 —— 本地生成产物（由 sync_exchanges.py 产出，不跟踪）
 exchanges.json

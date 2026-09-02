@@ -7,7 +7,7 @@
 
 用途：
     从多个外部源定期拉取交易所 / 机构热钱包地址标签，合并去重后写回
-    exchanges.json，供 monitor.py 使用。设计为在 GitHub Actions 中每日运行，
+    exchanges.json，供 all_coin_alarm.py 使用。设计为在 GitHub Actions 中每日运行，
     自动 commit 推送更新；也可本地手动运行。
 
 设计原则：
@@ -18,7 +18,7 @@
     - 不修改 exchanges.json 中的 _comment 字段（保留人工说明）
 
 源数据格式兼容：
-    每个源返回 JSON，自动识别三种结构（与 monitor.py 的解析器一致）：
+    每个源返回 JSON，自动识别三种结构（与 all_coin_alarm.py 的解析器一致）：
       1) {"addresses": {"0x...": "Binance 14", ...}}
       2) {"0x...": "Binance 14", ...}
       3) [{"address":"0x...", "label":"Binance"}, ...]   # label 也接受 name/tag/owner
@@ -65,14 +65,18 @@ HTTP_TIMEOUT = 30           # 单源拉取超时
 HTTP_MAX_RETRIES = 3        # 单源重试次数
 HTTP_BACKOFF_BASE = 2.0     # 指数退避基数
 
-# 地址合法性：0x 开头，长度 42
+# 默认文件名常量（避免在多处硬编码默认值）
+DEFAULT_SOURCES_FILE = "sources.json"
+DEFAULT_OUT_FILE = "exchanges.json"
+
+
 def _is_valid_address(s: Any) -> bool:
     s = str(s)
     return s.startswith("0x") and len(s) == 42
 
 
 # ------------------------------------------------------------------
-# JSON 解析（与 monitor.py 保持一致，兼容三种格式）
+# JSON 解析（与 all_coin_alarm.py 保持一致，兼容三种格式）
 # ------------------------------------------------------------------
 
 def parse_labels(data: Any) -> Dict[str, str]:
@@ -283,10 +287,10 @@ def write_exchanges(path: str, labels: Dict[str, str], comment: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="从外部源同步交易所地址标签到 exchanges.json")
-    parser.add_argument("--sources", default=os.getenv("SOURCES_FILE", "sources.json"),
-                        help="源列表 JSON 文件（默认 sources.json）")
-    parser.add_argument("--out", default=os.getenv("OUT_FILE", "exchanges.json"),
-                        help="输出文件路径（默认 exchanges.json）")
+    parser.add_argument("--sources", default=os.getenv("SOURCES_FILE", DEFAULT_SOURCES_FILE),
+                        help=f"源列表 JSON 文件（默认 {DEFAULT_SOURCES_FILE}）")
+    parser.add_argument("--out", default=os.getenv("OUT_FILE", DEFAULT_OUT_FILE),
+                        help=f"输出文件路径（默认 {DEFAULT_OUT_FILE}）")
     parser.add_argument("--comment",
                         default="交易所 / 机构已知热钱包地址标签库。由 sync_exchanges.py 自动维护。",
                         help="写入文件的 _comment 字段")

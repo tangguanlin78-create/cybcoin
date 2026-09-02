@@ -15,7 +15,7 @@
 
 [Unit]
 Description=ERC20 Token Transfer Monitor (read-only on-chain)
-Documentation=file:///opt/erc20-monitor/monitor.py
+Documentation=file:///opt/erc20-monitor/all_coin_alarm.py
 After=network-online.target
 Wants=network-online.target
 
@@ -34,7 +34,7 @@ WorkingDirectory=/opt/erc20-monitor
 EnvironmentFile=/etc/systemd/system/erc20-monitor.env
 
 # ---- 启动命令：config.json 也用绝对路径 ----
-ExecStart=/opt/erc20-monitor/venv/bin/python /opt/erc20-monitor/monitor.py /opt/erc20-monitor/config.json
+ExecStart=/opt/erc20-monitor/venv/bin/python /opt/erc20-monitor/all_coin_alarm.py /opt/erc20-monitor/config.json
 
 # ---- 进程管理：崩溃自动重启，指数退避，10s 内最多 5 次 ----
 Restart=on-failure

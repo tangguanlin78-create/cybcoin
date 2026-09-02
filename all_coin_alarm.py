@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-ERC20 代币转账监控程序（只读 / Read-Only On-chain Monitor）
+All Coin Alarm —— ERC20 代币转账监控告警程序（只读 / Read-Only On-chain Monitor）
 ================================================================================
 
 功能概述：
@@ -57,7 +57,7 @@ ERC20 代币转账监控程序（只读 / Read-Only On-chain Monitor）
 
 运行：
     pip install -r requirements.txt
-    python monitor.py
+    python all_coin_alarm.py
 
 systemd 守护（Linux 服务器常驻）：
     sudo cp erc20-monitor.service /etc/systemd/system/
@@ -93,6 +93,13 @@ TRANSFER_EVENT_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a
 
 # ERC20 decimals() 函数选择器：keccak256("decimals()") 的前 4 字节
 DECIMALS_SELECTOR = "0x313ce567"
+
+# 默认文件名常量（避免在多处硬编码默认值，确保将来改路径只需改一处）
+DEFAULT_CONFIG_FILE = "config.json"
+DEFAULT_STATE_FILE = "monitor_state.json"
+DEFAULT_LOG_FILE = "alerts.log"
+DEFAULT_EXCHANGES_FILE = "exchanges.json"
+DEFAULT_SOURCES_FILE = "sources.json"
 
 # 各链区块浏览器交易页前缀，用于拼接可点击的 tx 链接
 EXPLORER_TX_PREFIX = {
@@ -188,6 +195,9 @@ def _parse_tokens(cfg: Dict[str, Any], rpc: Optional[EthRpcClient] = None) -> Li
         skip_alert = bool(t.get("skip_alert", False))
 
         tokens.append({
+            # 多链模式：tokens[] 中显式 chain 字段
+            # 单链模式（旧 config.json 兼容）：缺省从顶层 chain 取
+            "chain": str(t.get("chain") or cfg.get("chain", "ethereum")).lower(),
             "contract": contract,
             "decimals": decimals,
             "symbol": symbol,
@@ -232,18 +242,50 @@ def load_config(path: str) -> Dict[str, Any]:
             cfg[cfg_key] = env_val.strip()
 
     # 3) 基本校验
-    required = ["rpc_url"]
-    # 代币配置二选一：tokens[] 或 token_contract
-    has_tokens_array = isinstance(cfg.get("tokens"), list) and len(cfg["tokens"]) > 0
-    has_single = bool(cfg.get("token_contract"))
-    if not has_tokens_array and not has_single:
-        required.extend(["tokens (数组)" , "token_contract (单代币)"])
-    for key in required:
-        if isinstance(key, str) and not cfg.get(key):
+    # 两种模式：
+    #   多链模式：rpc_urls(dict) + chains(list) + tokens[].chain
+    #   单链模式（旧兼容）：rpc_url(str) + chain(str) + tokens[]
+    is_multi_chain = isinstance(cfg.get("rpc_urls"), dict) and bool(cfg.get("rpc_urls"))
+    if is_multi_chain:
+        # 多链模式校验
+        if not cfg.get("chains") or not isinstance(cfg["chains"], list):
             raise ValueError(
-                f"配置项 {key} 不能为空。请在 config.json 中填写，或在 .env / 环境变量 "
-                f"{SENSITIVE_ENV_MAP.get(key, key.upper())} 中设置。"
+                "多链模式（rpc_urls）下必须配置 chains 列表，"
+                "如 [\"ethereum\",\"bsc\",\"polygon\"]"
             )
+        cfg["chains"] = [c.lower() for c in cfg["chains"]]
+        # 环境变量覆盖 rpc_urls：RPC_URL_<大写链名>
+        for chain_name in list(cfg["rpc_urls"].keys()):
+            env_key = f"RPC_URL_{chain_name.upper()}"
+            env_val = os.getenv(env_key)
+            if env_val:
+                cfg["rpc_urls"][chain_name] = env_val.strip()
+        # 校验启用的每条链都有 URL
+        for chain_name in cfg["chains"]:
+            url = cfg["rpc_urls"].get(chain_name, "")
+            if not url:
+                raise ValueError(
+                    f"多链模式: 链 {chain_name} 的 RPC URL 未配置。"
+                    f"请在 rpc_urls 中填写，或在 .env / 环境变量 "
+                    f"RPC_URL_{chain_name.upper()} 中设置。"
+                )
+        # 代币配置必须有 tokens[]
+        if not (isinstance(cfg.get("tokens"), list) and len(cfg["tokens"]) > 0):
+            raise ValueError("多链模式下必须配置 tokens[] 数组")
+    else:
+        # 单链模式（旧逻辑兼容）
+        required = ["rpc_url"]
+        # 代币配置二选一：tokens[] 或 token_contract
+        has_tokens_array = isinstance(cfg.get("tokens"), list) and len(cfg["tokens"]) > 0
+        has_single = bool(cfg.get("token_contract"))
+        if not has_tokens_array and not has_single:
+            required.extend(["tokens (数组)" , "token_contract (单代币)"])
+        for key in required:
+            if isinstance(key, str) and not cfg.get(key):
+                raise ValueError(
+                    f"配置项 {key} 不能为空。请在 config.json 中填写，或在 .env / 环境变量 "
+                    f"{SENSITIVE_ENV_MAP.get(key, key.upper())} 中设置。"
+                )
     # 飞书 webhook 可选：未配置时跳过推送（方便先测试 RPC / 监控逻辑）
     return cfg
 
@@ -278,6 +320,70 @@ def save_state(path: str, state: Dict[str, Any]) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------
+# 多链状态持久化（按 chain 分桶，兼容 v1 单链格式迁移）
+# ------------------------------------------------------------------
+
+def load_chain_state(path: str, chain: str) -> Dict[str, Any]:
+    """加载单条链的状态。多链模式下 state 文件结构：
+        {"_version": 2, "chains": {<chain>: {last_processed_block, alerted_txs}}}
+
+    兼容旧 v1 格式（顶层 last_processed_block）：若旧文件恰好属于该 chain，
+    数据会被自然继承；若不属于该 chain（多链模式下其他链），返回空状态。
+
+    Args:
+        path: 状态文件路径
+        chain: 链名（如 ethereum / bsc）
+    """
+    empty = {"last_processed_block": 0, "alerted_txs": {}}
+    if not os.path.exists(path):
+        return empty
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        logging.exception("状态文件 %s 损坏，已重置", path)
+        return empty
+    # v2 格式：{chains: {<chain>: {...}}}
+    if isinstance(data.get("chains"), dict):
+        chain_state = data["chains"].get(chain)
+        if not isinstance(chain_state, dict):
+            return empty
+        chain_state.setdefault("last_processed_block", 0)
+        chain_state.setdefault("alerted_txs", {})
+        return chain_state
+    # v1 格式：顶层 last_processed_block + alerted_txs
+    # 仅当本进程也只跑单链 ethereum 时，旧状态可继承；
+    # 多链模式下旧 v1 状态大概率属于原 cfg["chain"]，由调用方按 chain 匹配
+    if isinstance(data.get("last_processed_block"), int):
+        data.setdefault("alerted_txs", {})
+        return data
+    return empty
+
+
+def save_chain_state(path: str, chain: str, chain_state: Dict[str, Any]) -> None:
+    """原子写入单条链状态到多链 state 文件。
+
+    读取现有文件 → 替换该 chain 的状态 → 原子写回。其他链状态保持不变。
+    """
+    data: Dict[str, Any] = {"_version": 2, "chains": {}}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                old = json.load(f)
+            if isinstance(old.get("chains"), dict):
+                data["chains"] = dict(old["chains"])
+            # v1 格式不在此合并：多链模式下旧 v1 数据已被 load_chain_state
+            # 作为单链状态读取，重写时按 v2 写入即可，避免污染其他链
+        except (json.JSONDecodeError, OSError):
+            pass
+    data["chains"][chain] = chain_state
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
 
@@ -820,37 +926,67 @@ def send_feishu_alert(
 # ------------------------------------------------------------------
 
 class TransferMonitor:
-    def __init__(self, config_path: str = "config.json"):
+    def __init__(self, config_path: str = DEFAULT_CONFIG_FILE):
         self.config = load_config(config_path)
 
         # 日志先初始化，便于后续流程都有日志输出
-        self.log_file = self.config.get("log_file", "alerts.log")
+        self.log_file = self.config.get("log_file", DEFAULT_LOG_FILE)
         self._init_logging(self.log_file)
 
-        # 核心组件
-        self.rpc = init_rpc(self.config["rpc_url"])
-        self.chain = self.config.get("chain", "ethereum").lower()
+        # ---- 多链模式 vs 单链模式 ----
+        # 多链模式：rpc_urls(dict) + chains(list) + tokens[].chain
+        # 单链模式（旧 config.json 兼容）：rpc_url(str) + chain(str) + tokens[]
+        self.multi_chain_mode = isinstance(self.config.get("rpc_urls"), dict) \
+            and bool(self.config.get("rpc_urls"))
+
+        if self.multi_chain_mode:
+            self.chains: List[str] = list(self.config["chains"])
+            self.rpcs: Dict[str, "EthRpcClient"] = {
+                chain: init_rpc(self.config["rpc_urls"][chain])
+                for chain in self.chains
+            }
+        else:
+            # 单链模式：规范化为单元素结构
+            self.chains = [self.config.get("chain", "ethereum").lower()]
+            self.rpcs = {self.chains[0]: init_rpc(self.config["rpc_url"])}
+
+        # 全局阈值 / 轮询参数
         self.alert_threshold = float(self.config.get("alert_usd_threshold", 100_000))
         self.dust_threshold = float(self.config.get("dust_usd_threshold", 100))
         self.confirmations = int(self.config.get("confirmations", 6))
         self.poll_interval = int(self.config.get("poll_interval_seconds", 12))
 
-        # 解析代币列表（兼容 tokens[] 数组 / 单代币字段）
-        # 先占位 decimals=0，init 阶段用 rpc 覆盖
+        # 解析代币列表（_parse_tokens 已为每条 token 加 chain 字段，
+        # 缺省从 cfg["chain"] 取，向后兼容旧 config.json）
         self.tokens = _parse_tokens(self.config, rpc=None)
-        # 用 rpc 修正 decimals（若 config 填了 0）
+
+        # 校验每个 token 的 chain 都有对应 RPC 节点
+        for t in self.tokens:
+            if t["chain"] not in self.rpcs:
+                raise ValueError(
+                    f"代币 {t['symbol']}({t['contract'][:10]}...) "
+                    f"chain={t['chain']} 未配置对应 RPC 节点"
+                )
+
+        # 用各自链的 rpc 修正 decimals（若 config 填了 0）
         for t in self.tokens:
             if t["decimals"] == 0:
                 t["decimals"] = get_token_decimals(
-                    self.rpc, t["contract"], fallback=18
+                    self.rpcs[t["chain"]], t["contract"], fallback=18
                 )
 
-        # 构建合约地址 → 代币信息 映射（从 log.address 反查是哪个代币）
-        self._contract_to_token: Dict[str, Dict[str, Any]] = {
-            t["contract"]: t for t in self.tokens
+        # 按链分组 tokens + 构建合约地址 → token 映射（每条链独立一份）
+        self.tokens_by_chain: Dict[str, List[Dict[str, Any]]] = {
+            c: [] for c in self.chains
+        }
+        for t in self.tokens:
+            self.tokens_by_chain[t["chain"]].append(t)
+        self._contract_to_token_by_chain: Dict[str, Dict[str, Dict[str, Any]]] = {
+            c: {t["contract"]: t for t in self.tokens_by_chain[c]}
+            for c in self.chains
         }
 
-        # PriceOracle 批量拉取所有 coin_id（更高效）
+        # PriceOracle（多链共用，按 coin_id 去重）
         all_coin_ids = [t["coingecko_id"] for t in self.tokens if t["coingecko_id"]]
         self.price_oracle = PriceOracle(
             coin_ids=all_coin_ids,
@@ -861,53 +997,85 @@ class TransferMonitor:
         # 交易所标签库
         self.exchanges = ExchangeLabelStore(
             url=self.config.get("exchanges_url"),
-            local_path=self.config.get("exchanges_file", "exchanges.json"),
+            local_path=self.config.get("exchanges_file", DEFAULT_EXCHANGES_FILE),
             refresh_interval_seconds=int(self.config.get("exchanges_refresh_seconds", 3600)),
         )
         self.exchanges.init()
-        # 状态文件路径（提取为属性，避免循环里重复硬编码默认值）
-        self.state_file = self.config.get("state_file", "monitor_state.json")
-        self.state = load_state(self.state_file)
+
+        # 状态文件：按 chain 分桶（v2 格式），兼容旧 v1 单链状态自动迁移
+        self.state_file = self.config.get("state_file", DEFAULT_STATE_FILE)
+        self.states: Dict[str, Dict[str, Any]] = {
+            chain: load_chain_state(self.state_file, chain) for chain in self.chains
+        }
+
         self.feishu_webhook = self.config.get("feishu_webhook_url", "")
         self.feishu_webhook_secret = self.config.get("feishu_webhook_secret") or None
-        self.tx_link_prefix = EXPLORER_TX_PREFIX.get(self.chain, EXPLORER_TX_PREFIX["ethereum"])
+
+        # 每条链的浏览器前缀
+        self.tx_link_prefixes: Dict[str, str] = {
+            c: EXPLORER_TX_PREFIX.get(c, EXPLORER_TX_PREFIX["ethereum"])
+            for c in self.chains
+        }
+
+        # ---- 单链兼容别名（指向第一项，便于旧代码路径访问）----
+        self.rpc = self.rpcs[self.chains[0]]
+        self.chain = self.chains[0]
+        self.state = self.states[self.chains[0]]
+        self._contract_to_token = self._contract_to_token_by_chain[self.chains[0]]
+        self.tx_link_prefix = self.tx_link_prefixes[self.chains[0]]
 
         # 打印初始化摘要
         logging.info(
-            "监控器初始化完成: chain=%s tokens=%d confirmations=%d",
-            self.chain, len(self.tokens), self.confirmations,
+            "监控器初始化完成: chains=%s tokens=%d confirmations=%d multi_chain=%s",
+            self.chains, len(self.tokens), self.confirmations, self.multi_chain_mode,
         )
+        for c in self.chains:
+            logging.info("  [%s] tokens=%d", c, len(self.tokens_by_chain[c]))
         for t in self.tokens:
             logging.info(
-                "  - %s: contract=%s decimals=%d coingecko_id=%s threshold=$%.2f",
-                t["symbol"], t["contract"][:12] + "...", t["decimals"],
+                "  - %s@%s: contract=%s decimals=%d coingecko_id=%s threshold=$%.2f",
+                t["symbol"], t["chain"], t["contract"][:12] + "...", t["decimals"],
                 t["coingecko_id"] or "(无)", t["alert_threshold"],
             )
 
     # ---- 日志 ----
     def _init_logging(self, log_file: str) -> None:
+        import os
         fmt = "%(asctime)s [%(levelname)s] %(message)s"
         root = logging.getLogger()
         root.setLevel(logging.INFO)
-        # 控制台
-        sh = logging.StreamHandler(sys.stdout)
-        sh.setFormatter(logging.Formatter(fmt))
-        root.addHandler(sh)
+        # pythonw.exe 模式（Windows 后台无 console）下 sys.stdout 是无效 fd，
+        # StreamHandler flush 会触发 OSError Errno 22 累积拖垮进程。
+        # 用 sys.executable 名字直接判断 pythonw 模式，最可靠。
+        is_pythonw = os.path.basename(sys.executable).lower() == "pythonw.exe"
+        if not is_pythonw and sys.stdout is not None:
+            try:
+                sys.stdout.write(" ")  # 非空字符 + flush 测试 stdout 真的可写
+                sys.stdout.flush()
+                sh = logging.StreamHandler(sys.stdout)
+                sh.setFormatter(logging.Formatter(fmt))
+                root.addHandler(sh)
+            except (OSError, ValueError):
+                pass  # stdout 无效，跳过 StreamHandler
         # 文件（追加，作为本地告警留痕）
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setFormatter(logging.Formatter(fmt))
         root.addHandler(fh)
 
     # ---- 去重 ----
-    def _already_alerted(self, tx_hash: str) -> bool:
-        return tx_hash in self.state.get("alerted_txs", {})
+    def _already_alerted(self, chain: str, tx_hash: str) -> bool:
+        """检查某条链上某笔 tx 是否已告警。按 chain 分桶避免跨链误判。"""
+        state = self.states[chain]
+        return tx_hash in state.get("alerted_txs", {})
 
-    def _mark_alerted(self, tx_hash: str) -> None:
-        self.state.setdefault("alerted_txs", {})[tx_hash] = int(time.time())
+    def _mark_alerted(self, chain: str, tx_hash: str) -> None:
+        """标记某条链上某笔 tx 已告警。仅改内存，持久化由 _process_chain_range 完成。"""
+        state = self.states[chain]
+        state.setdefault("alerted_txs", {})[tx_hash] = int(time.time())
         # 控制 alerted_txs 体积，仅保留最近 10000 条
-        if len(self.state["alerted_txs"]) > 10000:
-            sorted_items = sorted(self.state["alerted_txs"].items(), key=lambda kv: kv[1])
-            self.state["alerted_txs"] = dict(sorted_items[-10000:])
+        if len(state["alerted_txs"]) > 10000:
+            sorted_items = sorted(state["alerted_txs"].items(), key=lambda kv: kv[1])
+            state["alerted_txs"] = dict(sorted_items[-10000:])
 
     # ---- 单笔转账处理 ----
     def _handle_transfer(self, t: Dict[str, Any], token_info: Dict[str, Any]) -> None:
@@ -918,8 +1086,9 @@ class TransferMonitor:
             token_info: 该代币的标准化配置 dict（含 contract / decimals / symbol / coingecko_id / alert_threshold / dust_threshold）
         """
         tx_hash = t["tx_hash"]
+        chain = token_info["chain"]
         # 防重复告警
-        if self._already_alerted(tx_hash):
+        if self._already_alerted(chain, tx_hash):
             return
 
         # 数量与 USD 价值
@@ -952,11 +1121,12 @@ class TransferMonitor:
         to_label = self.exchanges.lookup(t["to"])
         from_label = self.exchanges.lookup(t["from"])
 
-        # 组装告警消息
-        tx_link = self.tx_link_prefix + tx_hash
+        # 组装告警消息（tx_link_prefix 按代币所在链取）
+        tx_link = self.tx_link_prefixes[chain] + tx_hash
         symbol = token_info["symbol"]
-        title = f"大额 {symbol} 转账 ${usd_value:,.2f}"
+        title = f"[{chain.upper()}] 大额 {symbol} 转账 ${usd_value:,.2f}"
         lines = [
+            f"**链**: {chain}",
             f"**代币**: {symbol}",
             f"**数量**: {amount:,.4f}",
             f"**USD 价值**: ${usd_value:,.2f}",
@@ -965,11 +1135,41 @@ class TransferMonitor:
             f"**区块**: {t['block']}",
             f"**TxHash**: `{tx_hash}`",
         ]
-        if to_label:
-            lines.insert(0, f"⚠️ 接收方为交易所: **{to_label}**")
+        # 发送方/接收方标签分类提示
+        # exchanges.json 中可能含非交易所标签（如巨鲸、跨链桥、机构），
+        # 通过交易所关键词判断是否为交易所地址，区分显示逻辑。
+        EXCHANGE_KEYWORDS = (
+            "binance", "okx", "okex", "coinbase", "kraken", "bybit",
+            "bitfinex", "huobi", "kucoin", "gate", "mexc", "bitget",
+            "upbit", "bithumb", "poloniex", "gemini", "crypto.com",
+            "ftx", "bittrex", "bitstamp", "deribit", "bitmex",
+        )
 
-        logging.info("触发告警 [%s] tx=%s usd=%.2f to_exchange=%s",
-                     symbol, tx_hash, usd_value, to_label or "N/A")
+        def _is_exchange(label: str) -> bool:
+            if not label:
+                return False
+            low = label.lower()
+            return any(kw in low for kw in EXCHANGE_KEYWORDS)
+
+        is_to_exchange = _is_exchange(to_label)
+        is_from_exchange = _is_exchange(from_label)
+
+        if is_from_exchange and is_to_exchange:
+            lines.insert(0, f"⚠️ 交易所互转: from=**{from_label}** → to=**{to_label}**")
+        elif is_to_exchange:
+            lines.insert(0, f"⚠️ 接收方为交易所: **{to_label}**（资金流入，关注是否抛售）")
+        elif is_from_exchange:
+            lines.insert(0, f"⚠️ 发送方为交易所: **{from_label}**（提币流出，关注资金动向）")
+        elif to_label and from_label:
+            lines.insert(0, f"ℹ️ 标签地址互转: from=**{from_label}** → to=**{to_label}**")
+        elif to_label:
+            lines.insert(0, f"ℹ️ 接收方命中标签: **{to_label}**")
+        elif from_label:
+            lines.insert(0, f"ℹ️ 发送方命中标签: **{from_label}**")
+
+        logging.info("触发告警 [%s@%s] tx=%s usd=%.2f from_exchange=%s to_exchange=%s",
+                     symbol, chain, tx_hash, usd_value,
+                     from_label or "N/A", to_label or "N/A")
 
         # 推送飞书（未配置 webhook 时跳过，仅记日志）
         if self.feishu_webhook:
@@ -978,31 +1178,43 @@ class TransferMonitor:
                 secret=self.feishu_webhook_secret,
             )
             # 无论推送是否成功都标记已告警，防止失败时无限重推刷屏
-            self._mark_alerted(tx_hash)
+            self._mark_alerted(chain, tx_hash)
             if not ok:
-                logging.error("飞书推送失败但已标记 [%s] tx=%s，需人工核查 %s", symbol, tx_hash, self.log_file)
+                logging.error("飞书推送失败但已标记 [%s@%s] tx=%s，需人工核查 %s",
+                              symbol, chain, tx_hash, self.log_file)
         else:
-            logging.info("未配置飞书 webhook，跳过推送 [%s] tx=%s（已标记为已告警）", symbol, tx_hash)
-            self._mark_alerted(tx_hash)
+            logging.info("未配置飞书 webhook，跳过推送 [%s@%s] tx=%s（已标记为已告警）",
+                         symbol, chain, tx_hash)
+            self._mark_alerted(chain, tx_hash)
 
-    # ---- 区间处理 ----
-    def _process_range(self, from_block: int, to_block: int) -> None:
-        logging.info("处理区块区间 [%d, %d]", from_block, to_block)
-        all_contracts = [t["contract"] for t in self.tokens]
-        logs = fetch_transfer_logs(self.rpc, all_contracts, from_block, to_block)
+    # ---- 区间处理（按 chain 维度） ----
+    def _process_chain_range(self, chain: str, from_block: int, to_block: int) -> None:
+        """处理某条链上 [from_block, to_block] 区间内所有监控代币的 Transfer 事件。
+
+        单链模式下 chains=[<chain>]，等价于旧 _process_range；
+        多链模式下每条链独立调 eth_getLogs、独立 contract 映射、独立 state。
+        """
+        logging.info("[%s] 处理区块区间 [%d, %d]", chain, from_block, to_block)
+        contracts = [t["contract"] for t in self.tokens_by_chain.get(chain, [])]
+        if not contracts:
+            return
+        rpc = self.rpcs[chain]
+        contract_map = self._contract_to_token_by_chain[chain]
+        logs = fetch_transfer_logs(rpc, contracts, from_block, to_block)
         if not logs:
             return
-        logging.info("区间内 Transfer 事件数: %d", len(logs))
+        logging.info("[%s] 区间内 Transfer 事件数: %d", chain, len(logs))
         for log in logs:
             parsed = parse_transfer_log(log)
             if parsed is None:
                 continue
             # 从 log.address 反查是哪个代币
             contract_addr = str(log.get("address", "")).lower()
-            token_info = self._contract_to_token.get(contract_addr)
+            token_info = contract_map.get(contract_addr)
             if token_info is None:
                 # 不应该发生，eth_getLogs 只返回指定 address 的日志
-                logging.warning("Transfer 日志来自未监控合约: %s", contract_addr)
+                logging.warning("[%s] Transfer 日志来自未监控合约: %s",
+                                chain, contract_addr)
                 continue
             try:
                 self._handle_transfer(parsed, token_info)
@@ -1012,32 +1224,42 @@ class TransferMonitor:
 
     # ---- 主循环 ----
     def run(self) -> None:
-        logging.info("监控器启动。轮询间隔 %ds，确认区块 %d",
-                     self.poll_interval, self.confirmations)
-        # 首次启动若状态为 0，则从 (当前块 - 确认数) 开始，避免从头扫描全链
-        latest = self.rpc.block_number()
-        if self.state["last_processed_block"] == 0:
-            self.state["last_processed_block"] = max(0, latest - self.confirmations)
-            logging.info("首次启动，从区块 %d 开始", self.state["last_processed_block"])
-            save_state(self.state_file, self.state)
+        logging.info("监控器启动。轮询间隔 %ds，确认区块 %d，链数=%d chains=%s",
+                     self.poll_interval, self.confirmations,
+                     len(self.chains), self.chains)
+        # 首次启动：每条链若状态为 0，则从 (当前块 - 确认数) 开始，
+        # 避免从头扫描全链（多链模式下各链区块高度独立）
+        for chain in self.chains:
+            state = self.states[chain]
+            if state["last_processed_block"] == 0:
+                latest = self.rpcs[chain].block_number()
+                state["last_processed_block"] = max(0, latest - self.confirmations)
+                logging.info("[%s] 首次启动，从区块 %d 开始",
+                             chain, state["last_processed_block"])
+                save_chain_state(self.state_file, chain, state)
 
         while True:
             try:
                 # 定期刷新交易所标签库（超过 refresh_interval 才真正发起请求）
                 self.exchanges.maybe_refresh()
 
-                latest = self.rpc.block_number()
-                safe_block = latest - self.confirmations
-                last = self.state["last_processed_block"]
-                if safe_block > last:
-                    # 单批最多 500 个块，避免 RPC 节点对大区间报错
-                    to_block = min(safe_block, last + 500)
-                    self._process_range(last + 1, to_block)
-                    self.state["last_processed_block"] = to_block
-                    save_state(self.state_file, self.state)
-                else:
-                    # 没有新块，静默等待
-                    pass
+                # 逐链处理新块（每条链独立 block_number / state / eth_getLogs）
+                for chain in self.chains:
+                    state = self.states[chain]
+                    rpc = self.rpcs[chain]
+                    latest = rpc.block_number()
+                    safe_block = latest - self.confirmations
+                    last = state["last_processed_block"]
+                    if safe_block > last:
+                        # 单批最多 10 个块：Alchemy 免费档 eth_getLogs 限制
+                        # 单次区块跨度 ≤10，超过会 400 错误。出块 ~12s/块，轮询
+                        # 间隔 12s，每轮 10 块足够追上实时出块。
+                        # 若落后追赶（如重启后），需要多轮才能追上，每轮 10 块。
+                        to_block = min(safe_block, last + 10)
+                        self._process_chain_range(chain, last + 1, to_block)
+                        state["last_processed_block"] = to_block
+                        save_chain_state(self.state_file, chain, state)
+                    # else: 没有新块，静默跳到下一条链
             except KeyboardInterrupt:
                 logging.info("收到中断信号，退出")
                 break
@@ -1053,6 +1275,6 @@ class TransferMonitor:
 if __name__ == "__main__":
     # 配置文件路径可由命令行参数指定，默认 config.json
     # 敏感字段（RPC_URL / FEISHU_WEBHOOK_URL / COINGECKO_API_KEY）优先从 .env 或环境变量读取
-    config_file = sys.argv[1] if len(sys.argv) > 1 else "config.json"
+    config_file = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CONFIG_FILE
     monitor = TransferMonitor(config_file)
     monitor.run()

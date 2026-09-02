@@ -15,10 +15,10 @@ COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
 # 2) 复制程序与非敏感资源文件
-#    monitor.py            主程序
+#    all_coin_alarm.py            主程序
 #    custom_labels.json    自定义标签库（HEMI 巨鲸 / Bridge 等）
 #    sources.example.json  同步源模板（CI 用，容器内仅作参考）
-COPY monitor.py custom_labels.json sources.example.json ./
+COPY all_coin_alarm.py custom_labels.json sources.example.json ./
 
 # 3) 创建非 root 运行用户 + 持久化目录
 RUN useradd -r -u 1000 -m -d /home/monitor monitor \
@@ -35,4 +35,4 @@ ENV STATE_FILE=/data/monitor_state.json \
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import os; os.path.exists('/data/monitor_state.json') or exit(1)"
 
-ENTRYPOINT ["python", "monitor.py"]
+ENTRYPOINT ["python", "all_coin_alarm.py"]
