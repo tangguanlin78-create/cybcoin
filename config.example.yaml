@@ -6,52 +6,59 @@ feishu:
   secret: ""                       # 加签密钥，留空表示不加签
   timeout: 10
 
-# 多链 EVM 配置。etherscan_key 可在对应链的 https://etherscan.io/apis 等申请免费 Key
+# 多链 EVM 配置。Etherscan V2 API：一个 key 通查所有链（请求带 chainid）
+# 申请 key：https://etherscan.io/login 后 API Keys 页
 chains:
   ethereum:
     label: "以太坊 ETH"
-    etherscan_base: "https://api.etherscan.io/api"
+    chainid: 1
+    etherscan_base: "https://api.etherscan.io/v2/api"
     etherscan_key: "YOUR_ETHERSCAN_API_KEY"
     explorer_tx: "https://etherscan.io/tx/"
     explorer_address: "https://etherscan.io/address/"
     blockscout_base: "https://eth.blockscout.com/api/v2/"
-    rpc_url: ""                    # 可选，留空则不使用 RPC 兜底
+    rpc_url: ""                    # 可选公共 RPC，用于读 decimals/totalSupply；留空则跳过
   bsc:
     label: "BSC (BNB Chain)"
-    etherscan_base: "https://api.bscscan.com/api"
-    etherscan_key: "YOUR_BSCSCAN_API_KEY"
+    chainid: 56
+    etherscan_base: "https://api.etherscan.io/v2/api"
+    etherscan_key: "YOUR_ETHERSCAN_API_KEY"
     explorer_tx: "https://bscscan.com/tx/"
     explorer_address: "https://bscscan.com/address/"
     blockscout_base: "https://bsc.blockscout.com/api/v2/"
     rpc_url: ""
   polygon:
     label: "Polygon"
-    etherscan_base: "https://api.polygonscan.com/api"
-    etherscan_key: "YOUR_POLYGONSCAN_API_KEY"
+    chainid: 137
+    etherscan_base: "https://api.etherscan.io/v2/api"
+    etherscan_key: "YOUR_ETHERSCAN_API_KEY"
     explorer_tx: "https://polygonscan.com/tx/"
     explorer_address: "https://polygonscan.com/address/"
     blockscout_base: "https://polygon.blockscout.com/api/v2/"
     rpc_url: ""
   arbitrum:
     label: "Arbitrum One"
-    etherscan_base: "https://api.arbiscan.io/api"
-    etherscan_key: "YOUR_ARBISCAN_API_KEY"
+    chainid: 42161
+    etherscan_base: "https://api.etherscan.io/v2/api"
+    etherscan_key: "YOUR_ETHERSCAN_API_KEY"
     explorer_tx: "https://arbiscan.io/tx/"
     explorer_address: "https://arbiscan.io/address/"
     blockscout_base: "https://arbitrum.blockscout.com/api/v2/"
     rpc_url: ""
   base:
     label: "Base"
-    etherscan_base: "https://api.basescan.org/api"
-    etherscan_key: "YOUR_BASESCAN_API_KEY"
+    chainid: 8453
+    etherscan_base: "https://api.etherscan.io/v2/api"
+    etherscan_key: "YOUR_ETHERSCAN_API_KEY"
     explorer_tx: "https://basescan.org/tx/"
     explorer_address: "https://basescan.org/address/"
     blockscout_base: "https://base.blockscout.com/api/v2/"
     rpc_url: ""
   avalanche:
     label: "Avalanche C-Chain"
-    etherscan_base: "https://api.snowtrace.io/api"
-    etherscan_key: "YOUR_SNOWTRACE_API_KEY"
+    chainid: 43114
+    etherscan_base: "https://api.etherscan.io/v2/api"
+    etherscan_key: "YOUR_ETHERSCAN_API_KEY"
     explorer_tx: "https://snowtrace.io/tx/"
     explorer_address: "https://snowtrace.io/address/"
     blockscout_base: "https://avalanche.blockscout.com/api/v2/"

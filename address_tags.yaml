@@ -27,6 +27,12 @@ ethereum:
   "0x00000000219ab540356cbb839cbe05303d7705fa": { label: "Beacon Deposit Contract", type: "protocol" }
   "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": { label: "Wrapped Ether (WETH)",   type: "contract" }
 
+  # ---- 特殊地址 ----
+  "0x000000000000000000000000000000000000dead": { label: "黑洞销毁地址 (Burn)",   type: "burn" }
+
+  # ---- 交易所冷钱包（未在 Etherscan Top Accounts 页面，但为业内公认） ----
+  "0x1a9c8182c09f50c8318d769245bea52c32be35bc": { label: "Binance Cold Wallet",   type: "exchange" }
+
   # ---- 混币器 ----
   "0xa160cdab225685da1d56aa342ad8841c3b53f291": { label: "Tornado.Cash 100 ETH",  type: "mixer" }
 

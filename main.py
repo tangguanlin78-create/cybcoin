@@ -272,7 +272,7 @@ class WhaleAlertApp(tk.Tk):
                 threshold, hours)
             holders = ds.fetch_top_holders(
                 token_addr, info.decimals, info.total_supply,
-                self.qcfg["top_holders_limit"])
+                self.qcfg["top_holders_limit"], transfers=transfers)
             self.after(0, self._on_query_done, {
                 "chain": chain, "info": info, "transfers": transfers,
                 "holders": holders, "threshold": threshold, "hours": hours,

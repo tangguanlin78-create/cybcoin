@@ -19,8 +19,9 @@ TAGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "address_ta
 
 @dataclass
 class ChainConfig:
-    chain_id: str
+    chain_id: str          # 我们内部用的链标识（ethereum/bsc/...）
     label: str
+    etherscan_chainid: int  # Etherscan V2 的 chainid（1/56/137/...）
     etherscan_base: str
     etherscan_key: str
     explorer_tx: str
@@ -58,6 +59,7 @@ def get_chain(config: dict, chain_id: str) -> Optional[ChainConfig]:
     return ChainConfig(
         chain_id=chain_id,
         label=c.get("label", chain_id),
+        etherscan_chainid=int(c.get("chainid") or 0),
         etherscan_base=c.get("etherscan_base", ""),
         etherscan_key=(c.get("etherscan_key") or "").strip(),
         explorer_tx=c.get("explorer_tx", ""),
