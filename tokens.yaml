@@ -1,0 +1,30 @@
+# 常见 ERC20 代币符号 -> 合约地址映射
+# 输入代币符号时优先查此表；查不到时 GUI 会提示改填合约地址（0x 开头）。
+# decimals 由运行时从链上读取，这里不硬编码以免错误。
+# 用户可自行补充更多代币的合约地址。
+
+ethereum:
+  USDT: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+  USDC: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+  WETH: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+  DAI:  "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+  WBTC: "0x2260FAC5E4D2d4c0704c1c1F3d93673A9b4Dd826"
+  LINK: "0x514910771AF9Ca656af840dff83E8264EcFCD620"
+  # 可在此追加，例如:
+  # UNI:  "0x1f9840a85d5aF5bf1D1762F925BDDEc6B2c2c2c2c"
+  # PEPE: "0x..."
+
+bsc:
+  USDT: "0x55d398326f99059fF7754852460B15C9cA2C2c78"   # BSC-Peg USDT (18 decimals)
+  WBNB: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173b0994f"  # Wrapped BNB
+  # 可在此追加，例如:
+  # USDC: "0x8AC76A51cc950d9824D9b2A1B5a2c2c2c2c2c2c2"
+
+polygon: {}      # 用户自行补充
+
+arbitrum: {}     # 用户自行补充（WETH 等）
+
+base:
+  WETH: "0x4200000000000000000000000000000000000006"   # Base WETH
+
+avalanche: {}    # 用户自行补充（USDT/USDC/WAVAX 等）

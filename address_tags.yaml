@@ -1,0 +1,46 @@
+# 常见地址 -> 归属标签映射
+# 用于 Top10 持有人和转账双方打标。地址统一小写匹配。
+# 运行时查不到的地址会显示 "未知（待人工核实）"。
+# 用户可自行补充更多已知标签地址。
+#
+# 下列地址均来自 Etherscan / BscScan 公开 Name Tag（Top Accounts 页面），
+# 属于区块链上公开可见的标签，非任何私密数据。
+# 标签会随交易所轮换钱包而变化，建议定期核对。
+
+ethereum:
+  # ---- 交易所 ----
+  "0x28c6c06298d514db089934071355e5743bf21d60": { label: "Binance 14",            type: "exchange" }
+  "0xbe0eb53f46cd790cd13851d5eff43d12404d33e8": { label: "Binance 7",             type: "exchange" }
+  "0xf977814e90da44bfa03b6295a0616a897441acec": { label: "Binance Hot Wallet 20", type: "exchange" }
+  "0x47ac0fb4f2d84898e4d9e7b4dab3c24507a6d503": { label: "Binance-Peg Tokens",   type: "exchange" }
+  "0x40b38765696e3d5d8d9d834d8aad4bb6e418e489": { label: "Robinhood",            type: "exchange" }
+  "0x0e58e8993100f1cbe45376c410f97f4893d9bfcd": { label: "Upbit 41",              type: "exchange" }
+  "0xe92d1a43df510f82c66382592a047d288f85226f": { label: "Bitfinex 19",           type: "exchange" }
+  "0xafcd96e580138cfa2332c632e66308eacd45c5da": { label: "Gemini Cold Wallet",    type: "exchange" }
+  "0x8d05d9924fe935bd533a844271a1b2078eae6fcf": { label: "Kraken Cold Wallet 3",  type: "exchange" }
+  "0x9f1799fb47b1514f453bcebbc37ecfe883756e83": { label: "Kraken Cold Wallet 4",  type: "exchange" }
+
+  # ---- 跨链桥 / 协议合约 ----
+  "0x8315177ab297ba92a06054ce80a67ed4dbd7ed3a": { label: "Arbitrum Bridge",        type: "bridge" }
+  "0x49048044d57e1c92a77f79988d21fa8faf74e97e": { label: "Base Portal",            type: "bridge" }
+  "0x3bfc20f0b9afcace800d73d2191166ff16540258": { label: "Polkadot MultiSig",     type: "bridge" }
+  "0x00000000219ab540356cbb839cbe05303d7705fa": { label: "Beacon Deposit Contract", type: "protocol" }
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": { label: "Wrapped Ether (WETH)",   type: "contract" }
+
+  # ---- 混币器 ----
+  "0xa160cdab225685da1d56aa342ad8841c3b53f291": { label: "Tornado.Cash 100 ETH",  type: "mixer" }
+
+  # 可继续补充：Uniswap/Aave/Curve/Compound 金库与多签、其他交易所热/冷钱包等
+  # "0x...": { label: "...", type: "exchange|protocol|bridge|contract|mixer|individual" }
+
+bsc:
+  "0x7a8a34db9acd10c3b6277473b192fe47192569ca": { label: "Binance Hot Wallet 14", type: "exchange" }
+  # 可继续补充 BSC 上的 PancakeSwap/Maker 等
+
+polygon: {}      # 可补充 Polygon 上交易所/协议地址
+
+arbitrum: {}     # 可补充 Arbitrum 上交易所/协议地址
+
+base: {}         # 可补充 Base 上交易所/协议地址
+
+avalanche: {}    # 可补充 Avalanche 上交易所/协议地址
