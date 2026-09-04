@@ -1,0 +1,46 @@
+{
+  "_comment": "排除地址清单：from 或 to 命中以下任一分类的转账不推送飞书。用于过滤交易所热钱包日常调拨、做市商做市行为、稳定币增发/赎回等非市场情绪信号。地址全部小写。exchanges.json 中标签命中关键词也会自动归类（标签含 treasury/mint/issuance → stable_mint；含 wintermute/gsr/jump/cumberland 等 → market_makers；含交易所名且不含 cold/storage → exchange_hot），本文件用于补充关键词无法覆盖的地址。",
+  "_categories": {
+    "exchange_hot": "交易所热钱包：日常充值/提现/调拨钱包，转账频繁不代表资金动向",
+    "market_makers": "做市商地址：Wintermute / GSR / Jump / Cumberland / FalconX / Amber 等",
+    "stable_mint": "稳定币增发地址：USDT Treasury / USDC Mint / DAI Mint 等，转账=增发或赎回"
+  },
+  "_verification": "所有地址均经 Etherscan 标签或权威链上数据源（arbitragescanner/Whale Alert/Lookonchain）验证。最后核验日期：2026-09-03。",
+  "_note": "exchanges.json 已自动覆盖 357 个交易所地址 + Wintermute + Tether Treasury 等，本文件仅补充未在 exchanges.json 中的地址。",
+  "exchange_hot": [
+    "0x28c6c06298d514db089934073352b8a5c9e0c7f6",
+    "0x21a31ee1afc51d94c2efccaa2092ad1028285549",
+    "0xdfd5293d8e347dfe39e7a08305d8992a72d7d31e",
+    "0x56e81f171bcc27a05491a53211b0a917e2f9a9fd",
+    "0xe1940f578743367f38d3f25c2d2d32d6636929b6",
+    "0xad354cfbaa4a8572dd6df021514a3931a8329ef5",
+    "0xee7ae85f2fe2239e27d9c1e23fffe168d63b4055",
+    "0x567888d16682c8bf6479e68e55bbc72a53f8d70e",
+    "0x0681d8db0955669ea7e8e5bfac6a4632e1f115c0",
+    "0x4838b106fce684507f8e6b01633f3e3a10f3ea42"
+  ],
+  "market_makers": [
+    "0x51c72848c68a965f66fa7a88855f9f7784502a7f",
+    "0xf584f8728b874a6a5c7a8d4d387c9aae9172d621",
+    "0xaea6291cb48d9675b120f74e2f0b0de01db47a00",
+    "0xd8d6ffe342210057bf4dcc31da28d006f253cef0",
+    "0x4e4398f4b7683f721add73fc515d7db4f1a4df6e",
+    "0x87b49a99cbce4a9030e67919b776aa97d538adda",
+    "0xad6eaa735d9df3d7696fd03984379dae02ed8862",
+    "0x1157a2076b9bb22a85cc2c162f20fab3898f4101",
+    "0x9fc6bef0702cf47dcd2e5a42b48e19aed8732499",
+    "0x5f65f7b60967833348422279c5c475ccfa4e69d9"
+  ],
+  "stable_mint": [
+    "0x5754284f345afc66a98fbb0a0afe71e0f007b949",
+    "0xc6cde7c39eb2f0f0095f41570af89efc2c1ea828",
+    "0xfcb19e6a322b27c06842a71e8c725399f049ae3a",
+    "0x5b6122c109b78c6755486966148c1d70a50a47d7",
+    "0x19a932fc5a8320939c3575302a87051af22c2d9c",
+    "0xf4b51b14b9ee30dc37ec970b50a486f37686e2a8",
+    "0x25bb61643e4881147e6aabb65e6dd45cf2904155",
+    "0x4096a34e582664f969753b34da6e72d55b3c85c1",
+    "0x4d915dd2c56814bd3db51a1da35b302bcc9c8973",
+    "0xee5207d3c88562fc814496af0845b34cfd4afc8c"
+  ]
+}

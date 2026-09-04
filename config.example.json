@@ -36,7 +36,7 @@
   "_comment_coingecko_key": "CoinGecko API key（可选，敏感）。推荐放 .env 的 COINGECKO_API_KEY；免费版留空即可，限流约 30 次/分钟。Pro key 见 https://www.coingecko.com/api/pricing",
   "coingecko_api_key": "",
 
-  "_comment_alert_usd": "全局 USD 告警阈值（当 tokens[] 中未单独指定 alert_usd_threshold 时使用此值）",
+  "_comment_alert_usd": "【已废弃·仅兼容保留】全局 USD 告警阈值。当前推送门槛由程序内置 MIN_PUSH_USD（单笔 $50000 硬下限）+ R 值分级决定，此字段不参与推送判断",
   "alert_usd_threshold": 100000,
 
   "_comment_dust_usd": "全局 USD 灰尘阈值（当 tokens[] 中未单独指定 dust_usd_threshold 时使用此值）",

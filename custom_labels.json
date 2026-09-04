@@ -4,6 +4,18 @@
     "0x694fa0816999da16e8783c0f5cde68c13a33c4e6": "HEMI Whale #1 (持仓53%)",
     "0x200d04d82edc27e52286a382c0c9580a9a6eadd1": "HEMI Whale #4 (持仓3.4%)",
     "0xd9a436d687b04dd5cd3edc3325c9776fba685159": "HEMI Whale #10",
-    "0x5eaa10f99e7e6d177ef9f74e519e319aa49f191e": "Hemi L1 Standard Bridge (跨链桥)"
+    "0x5eaa10f99e7e6d177ef9f74e519e319aa49f191e": "Hemi L1 Standard Bridge (跨链桥)",
+    "_dex_test_note": "DEX 协议测试地址",
+    "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45": "Uniswap V3 SwapRouter02 (Ethereum)",
+    "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f": "Uniswap V2 Factory (Ethereum)",
+    "0x45312ea0eFf7E09C83CBE249fa1d7598c4C8cd4e": "Curve Router (Ethereum)",
+    "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7": "Curve 3Pool StableSwap (Ethereum)",
+    "0xD51a44d3FaE01049C58f6d6751A5c1dB27D64e6C": "Curve TriCrypto2Pool (Ethereum)",
+    "0x090d4613473dee047c3f2706764f49e0821d256e": "uniswap",
+    "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984": "uniswap",
+    "0x56178a0d5f301baf6cf3e1cd53d9863437345bf9": "uniswap",
+    "0x7a250d5630b4cf539739df2c5dacb4c659f2488d": "uniswap",
+    "0xa5836a1f1b6dbd88248f960cd83dcb2bde1c92ae": "uniswap",
+    "0xfa103c21ea2df71dfb92b0652f8b1d795e51cdef": "uniswap/huobi"
   }
 }

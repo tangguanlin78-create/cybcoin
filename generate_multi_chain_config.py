@@ -205,7 +205,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--top", type=int, default=100,
-        help="按 24h 成交额取前 N 个币种（默认 100）",
+        help="按 24h 成交额取前 N 个币种（默认 100）。传 0 表示全部（不做数量限制）",
+    )
+    parser.add_argument(
+        "--update-into", default="",
+        help="原地更新已有 config（如 config_v2.json）：保留其全部字段（rpc_urls/"
+             "state_file/log_file/feishu 等）、手工 tokens[]、以及 _corrections "
+             "黑名单中已剔除的错配记录，仅刷新自动生成的 tokens[]。",
     )
     parser.add_argument(
         "--chains", default="",
@@ -271,8 +277,12 @@ def main() -> int:
         })
     # 按成交额降序
     candidates.sort(key=lambda x: x["volume_24h_usd"], reverse=True)
-    top_n = candidates[: args.top]
-    print(f"  Top {len(top_n)} 币种（含 0 成交额的也保留排序在后）", flush=True)
+    if args.top and args.top > 0:
+        top_n = candidates[: args.top]
+        print(f"  Top {len(top_n)} 币种（含 0 成交额的也保留排序在后）", flush=True)
+    else:
+        top_n = candidates
+        print(f"  全量模式：保留全部 {len(top_n)} 个有目标链合约的币种", flush=True)
 
     # Step 4: 展开多链合约为 all_coin_alarm.py tokens[]
     print("\nStep 4: 展开多链合约为 tokens[] 记录...", flush=True)
@@ -307,6 +317,101 @@ def main() -> int:
     for chain, n in chain_usage.items():
         if n > 0:
             print(f"    {chain}: {n} 个合约", flush=True)
+
+    # ---- 原地更新模式：刷新已有 config（如 config_v2.json）的 tokens[] ----
+    # 保留：全部非 tokens 字段（rpc_urls/state_file/log_file/feishu/chains/阈值等）、
+    #       手工 tokens[]、_corrections 黑名单中已人工剔除的错配（chain,contract）、
+    #       旧记录里的人工覆盖（非 0 decimals / skip_alert）。
+    if args.update_into:
+        print(f"\nStep 5(update-into): 在 {args.update_into} 上原地更新 tokens[]...",
+              flush=True)
+        if not os.path.exists(args.update_into):
+            print(f"[ERROR] --update-into 目标不存在: {args.update_into}")
+            return 1
+        with open(args.update_into, "r", encoding="utf-8") as f:
+            old_cfg = json.load(f)
+        old_tokens = old_cfg.get("tokens", [])
+
+        # 黑名单：_corrections.removed_wrong_match 里记录过的错配 (chain, contract)
+        blocklist = set()
+        corrections = old_cfg.get("_corrections") or {}
+        for r in corrections.get("removed_wrong_match", []):
+            c, addr = r.get("chain"), str(r.get("contract", "")).lower()
+            if c and addr:
+                blocklist.add((c, addr))
+        print(f"  历史错配黑名单 {len(blocklist)} 条（不会被重新加入）", flush=True)
+
+        old_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for t in old_tokens:
+            key = (str(t.get("chain", "")).lower(),
+                   str(t.get("contract", "")).lower())
+            old_by_key[key] = t
+
+        merged: List[Dict[str, Any]] = []
+        seen = set()
+
+        # 1) 手工 tokens[] 原样保留（_source=manual），除非它在黑名单中
+        for t in old_tokens:
+            if t.get("_source") != "manual":
+                continue
+            key = (str(t.get("chain", "")).lower(),
+                   str(t.get("contract", "")).lower())
+            if key in seen or key in blocklist:
+                continue
+            seen.add(key)
+            merged.append(t)
+
+        # 2) 自动生成的 tokens；命中黑名单跳过；旧记录的人工覆盖带回
+        blocked_hits = 0
+        for t in new_tokens:
+            key = (t["chain"], t["contract"])
+            if key in seen:
+                continue
+            if key in blocklist:
+                blocked_hits += 1
+                continue
+            old = old_by_key.get(key)
+            if old:
+                if int(old.get("decimals", 0) or 0) != 0:
+                    t["decimals"] = int(old["decimals"])
+                if old.get("skip_alert"):
+                    t["skip_alert"] = True
+                # 人工改过的阈值也保留（与生成默认值不同才覆盖）
+                if old.get("alert_usd_threshold"):
+                    t["alert_usd_threshold"] = float(old["alert_usd_threshold"])
+                if old.get("dust_usd_threshold"):
+                    t["dust_usd_threshold"] = float(old["dust_usd_threshold"])
+            seen.add(key)
+            merged.append(t)
+
+        if blocked_hits:
+            print(f"  黑名单拦截重新加入的错配 {blocked_hits} 条", flush=True)
+
+        # 新增项清单（便于人工抽检小市值币错配）
+        old_keys = {(str(o.get("chain", "")).lower(),
+                     str(o.get("contract", "")).lower()) for o in old_tokens}
+        added = [t for t in merged
+                 if (t["chain"], t["contract"]) not in old_keys
+                 and t.get("_source") != "manual"]
+        print(f"  tokens[]: {len(old_tokens)} -> {len(merged)} 条；新增 {len(added)} 条",
+              flush=True)
+        if added:
+            print("  新增清单（建议抽检，CoinGecko symbol 可能错配）:", flush=True)
+            for t in added[:80]:
+                print(f"    + [{t['chain']}] {t['symbol']} "
+                      f"({t.get('coingecko_id')}) {t['contract']}", flush=True)
+            if len(added) > 80:
+                print(f"    ... 其余 {len(added) - 80} 条略", flush=True)
+
+        old_cfg["tokens"] = merged
+        tmp_path = args.out + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(old_cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, args.out)
+        print(f"\n==== 完成（原地更新） ====", flush=True)
+        print(f"  输出: {args.out}（其余配置字段未改动）", flush=True)
+        print(f"  启动: python all_coin_alarm.py {args.out}", flush=True)
+        return 0
 
     # Step 5: 合并手工 tokens[]（去重：chain + contract）
     print("\nStep 5: 合并原 config.json 的手工 tokens[]...", flush=True)

@@ -31,6 +31,18 @@
 CI（见 .github/workflows/sync-exchanges.yml）：
     每日 UTC 02:00 自动运行，有变更则 commit 推回 main 分支。
 
+生产服务器（Vultr 45.76.150.196，与 CI 并行的另一条更新链路）：
+    erc20mon 用户 crontab 每日 04:00（服务器时区 Asia/Shanghai）本地运行，
+    直接覆盖写 /opt/erc20-monitor/exchanges.json，all_coin_alarm.py 的
+    ExchangeLabelStore 检测到 mtime 变化后热加载，无需重启服务：
+        0 4 * * * /opt/erc20-monitor/venv/bin/python \
+            /opt/erc20-monitor/sync_exchanges.py \
+            --sources /opt/erc20-monitor/sources.json \
+            --out /opt/erc20-monitor/exchanges.json \
+            >> /opt/erc20-monitor/sync_exchanges.log 2>&1
+    注意：sources.json 中的本地文件条目（cex_labels.json / custom_labels.json）
+    按 sources.json 所在目录解析相对路径，crontab 下运行也能正确找到。
+
 数据源说明：
     公开交易所地址标签源较分散且许可证各异，使用前请确认：
     - GitHub 社区维护仓库（raw JSON URL）
@@ -237,6 +249,7 @@ def load_sources(path: str) -> List[Dict[str, str]]:
         ]
     也接受纯字符串列表 ["url1", "url2"]。
     url 既可以是 http(s) 远程地址，也可以是本地文件路径（fetch_url 会自动识别）。
+    本地相对路径相对于 sources.json 所在目录解析，避免 CWD 不同导致找不到文件。
     """
     if not os.path.exists(path):
         print(f"源文件 {path} 不存在", file=sys.stderr)
@@ -249,14 +262,21 @@ def load_sources(path: str) -> List[Dict[str, str]]:
     if not isinstance(data, list):
         print(f"源文件 {path} 格式错误：应为列表", file=sys.stderr)
         return []
+    # 相对路径基于 sources.json 所在目录
+    base_dir = os.path.dirname(os.path.abspath(path))
     for item in data:
         if isinstance(item, str):
-            sources.append({"name": item, "url": item})
+            url = item
+            name = item
         elif isinstance(item, dict) and item.get("url"):
-            sources.append({
-                "name": item.get("name") or item["url"],
-                "url": item["url"],
-            })
+            url = item["url"]
+            name = item.get("name") or url
+        else:
+            continue
+        # 非 http(s)/file:// 且非绝对路径的本地文件 → 相对 sources.json 目录解析
+        if not url.startswith(("http://", "https://", "file://")) and not os.path.isabs(url):
+            url = os.path.join(base_dir, url)
+        sources.append({"name": name, "url": url})
     return sources
 
 

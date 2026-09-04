@@ -1,23 +1,34 @@
 # ============================================================
-# systemd 服务单元文件 —— ERC20 代币转账监控器（只读）
+# systemd 服务单元文件 —— ERC20 代币转账监控器（只读，多链 config_v2）
 # ============================================================
 # 安装步骤：
 #   1) sudo cp erc20-monitor.service /etc/systemd/system/erc20-monitor.service
-#   2) sudo cp erc20-monitor.env     /etc/systemd/system/erc20-monitor.env
-#      编辑后者填入 RPC_URL / FEISHU_WEBHOOK_URL / COINGECKO_API_KEY
+#   2) 敏感配置二选一：
+#      a) 推荐：在 /opt/erc20-monitor/.env 中填写（程序启动时自动 load_dotenv）：
+#         RPC_URL_ETHEREUM=... / RPC_URL_BSC=... / RPC_URL_POLYGON=...
+#         RPC_URL_ARBITRUM=... / RPC_URL_OPTIMISM=... / RPC_URL_BASE=...
+#         RPC_URL_AVALANCHE=... / FEISHU_WEBHOOK_URL=... / FEISHU_WEBHOOK_SECRET=...
+#         COINGECKO_API_KEY=...
+#      b) 或复制 erc20-monitor.env 到 /etc/systemd/system/erc20-monitor.env（同样 KEY=VALUE）
 #   3) sudo systemctl daemon-reload
 #   4) sudo systemctl enable --now erc20-monitor
 #   5) journalctl -u erc20-monitor -f            # 实时日志
 #      sudo systemctl status erc20-monitor        # 状态
-#      sudo systemctl restart erc20-monitor       # 重启（如改了 config.json）
+#      sudo systemctl restart erc20-monitor       # 重启（如改了 config_v2.json）
 #
 # 权限：服务以专用只读用户运行，仅能访问工作目录，无 sudo 权限。
 
 [Unit]
-Description=ERC20 Token Transfer Monitor (read-only on-chain)
+Description=ERC20 Token Transfer Monitor (read-only on-chain, multi-chain)
 Documentation=file:///opt/erc20-monitor/all_coin_alarm.py
 After=network-online.target
 Wants=network-online.target
+
+# ---- 崩溃重启限流：60s 内最多启动 5 次 ----
+# 注意：StartLimit* 必须放在 [Unit] 段；写在 [Service] 段会被 systemd
+# 忽略（仅打 warning），限流实际不生效
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -26,21 +37,19 @@ Type=simple
 User=erc20mon
 Group=erc20mon
 
-# ---- 工作目录：程序与配置都放这里 ----
+# ---- 工作目录：程序与配置都放这里（.env 也放此目录，程序自动加载）----
 WorkingDirectory=/opt/erc20-monitor
 
-# ---- 敏感配置通过 EnvironmentFile 注入（不写进 unit、不进日志）----
-# 文件权限建议 0600，属主 root:erc20mon
-EnvironmentFile=/etc/systemd/system/erc20-monitor.env
+# ---- 敏感配置（可选）：EnvironmentFile 不存在也不报错（前缀 -）----
+# .env 已放在 WorkingDirectory 时可留空此文件；文件权限建议 0600
+EnvironmentFile=-/etc/systemd/system/erc20-monitor.env
 
-# ---- 启动命令：config.json 也用绝对路径 ----
-ExecStart=/opt/erc20-monitor/venv/bin/python /opt/erc20-monitor/all_coin_alarm.py /opt/erc20-monitor/config.json
+# ---- 启动命令：多链配置 config_v2.json ----
+ExecStart=/opt/erc20-monitor/venv/bin/python /opt/erc20-monitor/all_coin_alarm.py /opt/erc20-monitor/config_v2.json
 
-# ---- 进程管理：崩溃自动重启，指数退避，10s 内最多 5 次 ----
+# ---- 进程管理：崩溃自动重启（重启限流见 [Unit] 段 StartLimit*）----
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # ---- 日志：交给 journald，可用 journalctl -u erc20-monitor 查看 ----
 StandardOutput=journal
@@ -64,9 +73,9 @@ RemoveIPC=true
 RestrictAddressFamilies=AF_INET AF_INET6
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
-# 资源限制（按需调整）
-MemoryMax=512M
-TasksMax=128
+# 资源限制（全量 800+ 币种时 decimals 并发拉取 + 多链轮询，略放宽内存）
+MemoryMax=768M
+TasksMax=256
 
 [Install]
 WantedBy=multi-user.target

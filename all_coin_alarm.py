@@ -10,8 +10,8 @@ All Coin Alarm —— ERC20 代币转账监控告警程序（只读 / Read-Only 
     2. 采用轮询区块方式（不使用 websocket），避免长连接网络抖动
     3. 已处理区块 / 已告警交易持久化到本地，不重复处理、不重复告警
     4. 转账金额折算 USD 超过阈值才告警；过滤灰尘小额交易
-    5. 解析每笔转账的 from / to / 数量 / USD 价值，识别接收方是否交易所
-    6. 触发告警后调用飞书 webhook 推送卡片消息，附带区块浏览器交易链接
+    5. 解析每笔转账的 from / to / 数量 / USD 价值，识别发送方 / 接收方是否交易所
+    6. 仅当发送方或接收方为交易所时，调用飞书 webhook 推送卡片消息，附带区块浏览器交易链接
     7. 异常捕获：RPC 限流、网络失败、价格获取失败等，自动重试 / 降级
 
 安全声明：
@@ -76,8 +76,13 @@ import hmac
 import json
 import logging
 import os
+import queue
+import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -100,6 +105,39 @@ DEFAULT_STATE_FILE = "monitor_state.json"
 DEFAULT_LOG_FILE = "alerts.log"
 DEFAULT_EXCHANGES_FILE = "exchanges.json"
 DEFAULT_SOURCES_FILE = "sources.json"
+DEFAULT_EXCLUDED_ADDRESSES_FILE = "excluded_addresses.json"
+
+# 交易所名称关键词：用于从 exchanges.json 标签中识别"交易所地址"，
+# 也用于排除地址库把交易所地址默认视为热钱包（除非标签含 cold/storage）。
+# 交易所关键词：用于识别"某地址是否为交易所地址"（CEX + DEX 统称）
+# 推送门槛：任一方是交易所才推送；双方都是 CEX 才跳过（DEX↔CEX / DEX↔DEX 均推送）
+CEX_KEYWORDS = (
+    "binance", "okx", "okex", "coinbase", "kraken", "bybit",
+    "bitfinex", "huobi", "kucoin", "gate", "mexc", "bitget",
+    "upbit", "bithumb", "poloniex", "gemini", "crypto.com",
+    "ftx", "bittrex", "bitstamp", "deribit", "bitmex",
+)
+DEX_KEYWORDS = (
+    # 链上大额资金进出的 DEX 协议
+    "uniswap", "curve",
+)
+# 合并后用于 is_exch() 判定（保持向后兼容）
+EXCHANGE_KEYWORDS = CEX_KEYWORDS + DEX_KEYWORDS
+
+
+def _is_cex(label: Optional[str]) -> bool:
+    """标签是否识别为 CEX（中心化交易所）。"""
+    return bool(label) and any(kw in label.lower() for kw in CEX_KEYWORDS)
+
+
+def _is_dex(label: Optional[str]) -> bool:
+    """标签是否识别为 DEX（去中心化交易所）。"""
+    return bool(label) and any(kw in label.lower() for kw in DEX_KEYWORDS)
+
+
+def _is_exch(label: Optional[str]) -> bool:
+    """标签是否识别为交易所（CEX 或 DEX）。"""
+    return _is_cex(label) or _is_dex(label)
 
 # 各链区块浏览器交易页前缀，用于拼接可点击的 tx 链接
 EXPLORER_TX_PREFIX = {
@@ -123,12 +161,177 @@ COINGECKO_PLATFORM = {
     "avalanche": "avalanche",
 }
 
-# CoinGecko 价格端点（免费版）
-COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+# CoinGecko 两个服务端域名：
+#   api.coingecko.com      —— Demo Key / 匿名用户（免费档），30 req/min
+#   pro-api.coingecko.com  —— Pro Key（付费档），500 req/min + 更低延迟 SLA
+CG_PUBLIC_BASE = "https://api.coingecko.com/api/v3"
+CG_PRO_BASE = "https://pro-api.coingecko.com/api/v3"
+
+# Demo key 与 Pro key 共享 "CG-" 前缀，静态无法区分；而两种 key 在错误
+# 域名下都会返回 400 / error_code 10010 或 10011（分别提示换域名）。
+# 所以必须启动时用 **一次最小请求（/ping）** 实测判定 key 类型，
+# 再把 (base_url, auth_header) 锁为匹配组合，后续请求零歧议。
+_CG_KEY_TYPE_UNKNOWN = "unknown"
+_CG_KEY_TYPE_DEMO = "demo"
+_CG_KEY_TYPE_PRO = "pro"
+_CG_KEY_TYPE_NONE = "none"
+
+# "CG key 类型探测"缓存进程级共享结果；启动一次性探测后锁定，后续零开销。
+_CG_DETECTED: Dict[str, str] = {}   # {key_stripped: type}
+_CG_DETECT_LOCK = threading.Lock()
+
+
+def _detect_cg_key_type(api_key: str) -> str:
+    """用 /ping 最小请求实测 key 是 Demo / Pro / 无效 / 无 key。
+
+    仅在进程内首次出现该 key 时发 2 个 HTTP 请求（先发 pro-api + x-cg-pro-api-key，
+    若返回 10011 则回落到 demo 配置探测），之后按结果全局缓存。2 次请求
+    的代价远小于"每次请求用错域名导致的 400 失败+重试"。
+
+    返回值: _CG_KEY_TYPE_NONE / _CG_KEY_TYPE_DEMO / _CG_KEY_TYPE_PRO
+    """
+    api_key = api_key.strip() if api_key else ""
+    if not api_key:
+        return _CG_KEY_TYPE_NONE
+
+    with _CG_DETECT_LOCK:
+        if api_key in _CG_DETECTED:
+            return _CG_DETECTED[api_key]
+
+    def _try(base: str, header_name: str) -> bool:
+        """向指定 base 发 /ping，带指定头名。成功返回 True。"""
+        try:
+            r = requests.get(
+                base + "/ping",
+                headers={"accept": "application/json", header_name: api_key},
+                timeout=15,
+            )
+        except requests.RequestException:
+            return False
+        if r.status_code == 200:
+            return True
+        # 两种"域名对但 key 错"场景是 401/403，但真正区分 Demo/Pro 的是 10010/10011
+        try:
+            err = (r.json() or {}).get("status", {}).get("error_message", "")
+            code = (r.json() or {}).get("error_code")
+        except ValueError:
+            return False
+        # 关键分流：
+        #  10010 = "If you are using Pro key, change URL from api -> pro-api"
+        #          → 在 api 域下用 pro 头命中这条，说明 key = Pro 档
+        #  10011 = "If you are using Demo key, change URL from pro-api -> api"
+        #          → 在 pro-api 域下用 demo 头命中这条，说明 key = Demo 档
+        if code == 10010:
+            return False  # 当前组合不对
+        if code == 10011:
+            return False
+        # 其他错误（401 key invalid / 404 等）一律视为该组合不可用
+        return False
+
+    # 先试 Pro 组合（pro-api + x-cg-pro-api-key）
+    pro_ok = _try(CG_PRO_BASE, "x-cg-pro-api-key")
+    # 再试 Demo 组合（api + x-cg-demo-api-key）
+    demo_ok = _try(CG_PUBLIC_BASE, "x-cg-demo-api-key")
+
+    if pro_ok and not demo_ok:
+        t = _CG_KEY_TYPE_PRO
+    elif demo_ok and not pro_ok:
+        t = _CG_KEY_TYPE_DEMO
+    elif pro_ok and demo_ok:
+        # 极端：两种组合都 200（少见），选 Pro（SLA 更高）
+        t = _CG_KEY_TYPE_PRO
+    else:
+        # 都不 OK → 网络或 key 彻底无效。保守退回 Demo 路径（匿名也能用），
+        # 让后续正式请求再失败并打日志。
+        logging.warning(
+            "CoinGecko key 类型探测失败（pro=OK=%s, demo=OK=%s），回退到公共域名/Demo头，"
+            "正式请求如持续失败请核对 key 与账户状态。", pro_ok, demo_ok,
+        )
+        t = _CG_KEY_TYPE_DEMO
+
+    logging.info("CoinGecko API key 类型探测: %s（Pro 组合 OK=%s, Demo 组合 OK=%s）",
+                 t.upper(), pro_ok, demo_ok)
+    with _CG_DETECT_LOCK:
+        _CG_DETECTED[api_key] = t
+    return t
+
+
+def _cg_base_url(api_key: str) -> str:
+    """根据实测 key 类型返回匹配的基址。无 key → 公共域名。"""
+    api_key = api_key.strip() if api_key else ""
+    if not api_key:
+        return CG_PUBLIC_BASE
+    t = _detect_cg_key_type(api_key)
+    return CG_PRO_BASE if t == _CG_KEY_TYPE_PRO else CG_PUBLIC_BASE
+
+
+def _cg_auth_header(api_key: str) -> Dict[str, str]:
+    """根据实测 key 类型返回对应鉴权头。空 key → 空 dict（匿名）。"""
+    api_key = api_key.strip() if api_key else ""
+    if not api_key:
+        return {}
+    t = _detect_cg_key_type(api_key)
+    if t == _CG_KEY_TYPE_PRO:
+        return {"x-cg-pro-api-key": api_key}
+    return {"x-cg-demo-api-key": api_key}
+
+
+# CoinGecko 价格端点（免费版）——基址按 key 类型在调用处注入
+COINGECKO_PRICE_PATH = "/simple/price"
+
+# CoinGecko markets 端点（批量获取 market_cap / circulating_supply / total_volume）
+COINGECKO_MARKETS_PATH = "/coins/markets"
+
+# CoinGecko 单币 market_chart 端点（7d volumes 拉取）；{coin_id} 在调用处 format 插入
+COINGECKO_MARKET_CHART_PATH = "/coins/{coin_id}/market_chart"
+
+# 单次价格请求最多携带的 coin_id 数（避免 URL 过长被服务端拒绝）
+PRICE_BATCH = 100
+
+# markets 端点单页最多返回的币数
+MARKETS_PER_PAGE = 250
+
+# 7d 均量后台拉取限速间隔（秒）：CoinGecko demo 档 30 req/min，2.2s ≈ 27/min 留余量
+CG_7D_FETCH_INTERVAL = 2.2
 
 # HTTP 重试相关
 MAX_RETRIES = 5           # 单次外部调用最大重试次数
 RETRY_BACKOFF_BASE = 2.0  # 指数退避基数（秒）
+
+# ---- 新告警分级阈值 ----
+# R = 转账 USD 价值 / 7d 日均成交量
+SEVERITY_RATIO_NORMAL_MIN = 0.005   # R < 0.5% 不推送
+SEVERITY_RATIO_IMPORTANT_MIN = 0.02  # 0.5% ≤ R < 2% 普通；2% ≤ R < 5% 重要
+SEVERITY_RATIO_CRITICAL_MIN = 0.05  # R ≥ 5% 严重
+SEVERITY_MCAP_CRITICAL_RATIO = 0.01  # 转账 ≥ 流通市值 1% 直接严重
+MIN_PUSH_USD = 50_000.0              # 金额硬下限：低于此值不推送
+
+# 7d 日均成交量可靠性下限：低于此值说明该币种在公开市场几乎没有交易，
+# CoinGecko 数据可能不完整（如已下线/低流动性/数据缺失），不应使用 R 值分级。
+# 这种情况下：累计金额仍 ≥ MIN_PUSH_USD 才推，按 normal 处理。
+MIN_VOLUME_RELIABLE_USD = 10_000.0
+
+# ---- 合并窗口 / 冷却 ----
+MERGE_WINDOW_SECONDS = 300   # 同 (chain,symbol,from,to) 5 分钟内合并
+COOLDOWN_SECONDS = 600       # 同地址推送后 10 分钟冷却
+AGGREGATOR_FLUSH_INTERVAL = 30  # Aggregator 每 30 秒扫描一次到期桶
+MAX_ALERT_PUSH_ATTEMPTS = 3  # 同一合并桶飞书推送最大尝试次数，超过则放弃丢弃
+
+# ---- 排除地址标签关键词 ----
+# 用于从 exchanges.json 的标签中识别"做市商 / 稳定币增发 / 交易所热钱包"
+MARKET_MAKER_KEYWORDS = (
+    "wintermute", "gsr", "jump trading", "jump crypto", "b2c2",
+    "cumberland", "falconx", "ambergroup", "galaxy", "blockdaemon",
+    "chainraisers", "flow traders", "darwin", "blueseed",
+    "impermanent", "dexlab",
+)
+STABLE_MINT_KEYWORDS = (
+    "treasury", "mint", "issuance", "issuer", "tether treasury",
+    "usdt treasury", "usdc treasury", "circle mint",
+)
+EXCHANGE_HOT_KEYWORDS = (
+    "hot wallet", "hotwallet", "warm wallet", "operational",
+)
 
 
 # ------------------------------------------------------------------
@@ -190,6 +393,8 @@ def _parse_tokens(cfg: Dict[str, Any], rpc: Optional[EthRpcClient] = None) -> Li
             decimals = 18  # 先占位，init 阶段再用 rpc 覆盖
         symbol = str(t.get("symbol") or "TOKEN")
         coin_id = str(t.get("coingecko_id") or t.get("coin_id") or "")
+        # alert_usd_threshold 为历史遗留字段（仅兼容旧配置保留），
+        # 当前推送门槛由代码常量 MIN_PUSH_USD（$50000 硬下限）+ R 值分级决定
         alert_th = float(t.get("alert_usd_threshold") or t.get("alert_threshold") or global_alert)
         dust_th = float(t.get("dust_usd_threshold") or t.get("dust_threshold") or global_dust)
         skip_alert = bool(t.get("skip_alert", False))
@@ -291,52 +496,22 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------
-# 状态持久化：已处理区块 + 已告警交易哈希，避免重复处理 / 重复告警
-# ------------------------------------------------------------------
-
-def load_state(path: str) -> Dict[str, Any]:
-    """加载本地状态。结构：
-        {
-          "last_processed_block": <int>,
-          "alerted_txs": { "<tx_hash>": <iso timestamp>, ... }
-        }
-    """
-    if not os.path.exists(path):
-        return {"last_processed_block": 0, "alerted_txs": {}}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        state.setdefault("last_processed_block", 0)
-        state.setdefault("alerted_txs", {})
-        return state
-    except (json.JSONDecodeError, OSError):
-        # 状态文件损坏时从 0 开始，宁可漏告警也不能崩溃
-        logging.exception("状态文件 %s 损坏，已重置", path)
-        return {"last_processed_block": 0, "alerted_txs": {}}
-
-
-def save_state(path: str, state: Dict[str, Any]) -> None:
-    """原子写入状态文件，防止写入中途崩溃导致文件损坏。"""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
-
-
-# ------------------------------------------------------------------
 # 多链状态持久化（按 chain 分桶，兼容 v1 单链格式迁移）
 # ------------------------------------------------------------------
 
-def load_chain_state(path: str, chain: str) -> Dict[str, Any]:
+def load_chain_state(path: str, chain: str,
+                     allow_v1_inherit: bool = True) -> Dict[str, Any]:
     """加载单条链的状态。多链模式下 state 文件结构：
         {"_version": 2, "chains": {<chain>: {last_processed_block, alerted_txs}}}
 
-    兼容旧 v1 格式（顶层 last_processed_block）：若旧文件恰好属于该 chain，
-    数据会被自然继承；若不属于该 chain（多链模式下其他链），返回空状态。
+    兼容旧 v1 格式（顶层 last_processed_block）：仅单链模式下继承（v1 数据
+    必属于当前唯一链）；多链模式下无法判断 v1 数据属于哪条链，盲继承会让
+    其他链从错误区块号起步——落后则重复告警，超前则静默卡死。
 
     Args:
         path: 状态文件路径
         chain: 链名（如 ethereum / bsc）
+        allow_v1_inherit: 是否允许继承 v1 单链旧状态（仅单链模式应为 True）
     """
     empty = {"last_processed_block": 0, "alerted_txs": {}}
     if not os.path.exists(path):
@@ -356,11 +531,11 @@ def load_chain_state(path: str, chain: str) -> Dict[str, Any]:
         chain_state.setdefault("alerted_txs", {})
         return chain_state
     # v1 格式：顶层 last_processed_block + alerted_txs
-    # 仅当本进程也只跑单链 ethereum 时，旧状态可继承；
-    # 多链模式下旧 v1 状态大概率属于原 cfg["chain"]，由调用方按 chain 匹配
     if isinstance(data.get("last_processed_block"), int):
-        data.setdefault("alerted_txs", {})
-        return data
+        if allow_v1_inherit:
+            data.setdefault("alerted_txs", {})
+            return data
+        logging.info("多链模式忽略 v1 旧状态（无法归属链 %s），该链从最新区块附近启动", chain)
     return empty
 
 
@@ -381,6 +556,20 @@ def save_chain_state(path: str, chain: str, chain_state: Dict[str, Any]) -> None
         except (json.JSONDecodeError, OSError):
             pass
     data["chains"][chain] = chain_state
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def save_all_chain_states(path: str, states: Dict[str, Dict[str, Any]]) -> None:
+    """一次性原子写入全部链状态（内存 states 为权威副本）。
+
+    替代逐链 save_chain_state 的"读整个文件 → 改一条 → 写回"模式：
+    多链下每轮每条链都会推进，逐链保存意味着每轮 7 次全量读+写+JSON
+    序列化（文件数百 KB 且随 alerted_txs 增长）；批量写只做 1 次。
+    """
+    data = {"_version": 2, "chains": states}
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -446,6 +635,8 @@ class ExchangeLabelStore:
         self.cache_path = cache_path or (local_path + ".cache")
         self._labels: Dict[str, str] = {}
         self._last_refresh: float = 0.0
+        # 本地 exchanges.json 的 mtime，用于检测外部更新（如服务器 cron 同步）后热重载
+        self._local_mtime: float = 0.0
 
     def _load_from_file(self, path: str) -> Dict[str, str]:
         if not os.path.exists(path):
@@ -507,13 +698,42 @@ class ExchangeLabelStore:
         else:
             logging.warning("无可用交易所标签来源，启动后将以空表运行")
 
+        # 记录本地文件的初始 mtime，供 maybe_refresh 热重载检测
+        if self.local_path and os.path.exists(self.local_path):
+            try:
+                self._local_mtime = os.path.getmtime(self.local_path)
+            except OSError:
+                pass
+
         if self.url:
             self._do_refresh()  # 启动时立即拉一次最新
         else:
             logging.info("未配置 exchanges_url，仅使用本地标签库")
 
+    def _maybe_reload_local(self) -> None:
+        """检测本地 exchanges.json 是否被外部更新（如 cron 运行 sync_exchanges.py），
+        mtime 变化则热重载，无需重启服务。"""
+        if not self.local_path or not os.path.exists(self.local_path):
+            return
+        try:
+            mtime = os.path.getmtime(self.local_path)
+        except OSError:
+            return
+        if mtime <= self._local_mtime:
+            return
+        labels = self._load_from_file(self.local_path)
+        if labels:
+            self._labels = labels
+            logging.info(
+                "检测到 %s 被外部更新，热重载交易所标签 %d 个",
+                self.local_path, len(labels),
+            )
+        self._local_mtime = mtime
+
     def maybe_refresh(self) -> None:
         """主循环周期性调用：超过 refresh_interval 才真正拉取。"""
+        # 先检查本地文件是否被外部工具更新（cron 同步后无需重启即可生效）
+        self._maybe_reload_local()
         if not self.url:
             return
         if time.time() - self._last_refresh >= self.refresh_interval:
@@ -586,52 +806,73 @@ class PriceOracle:
         ))
         self.api_key = api_key.strip() if api_key else ""
         self.ttl = max(ttl_seconds, 10)
+        # 根据 key 类型选择域名（Pro key → pro-api.coingecko.com）
+        self._base_url = _cg_base_url(self.api_key)
+        self._price_url = self._base_url + COINGECKO_PRICE_PATH
         self._prices: Dict[str, Optional[float]] = {cid: None for cid in self.coin_ids}
         self._fetched_at: float = 0.0
+        self._no_price_warned: set = set()  # 已提示过无 USD 价格的 coin_id，避免每轮刷日志
 
     def _fetch(self) -> None:
-        """批量拉取所有 coin_id 的 USD 价格，失败时保持旧缓存。"""
+        """批量拉取所有 coin_id 的 USD 价格，失败时保持旧缓存。
+
+        全量币种模式下 coin_id 可能有 400+ 个，单次请求 URL 过长可能被拒，
+        按 PRICE_BATCH 分批请求后合并结果。
+        """
         if not self.coin_ids:
             return
-        headers = {"accept": "application/json"}
-        if self.api_key:
-            headers["x-cg-demo-api-key"] = self.api_key
+        headers: Dict[str, str] = {"accept": "application/json"}
+        headers.update(_cg_auth_header(self.api_key))
+        url = self._price_url
 
-        params = {"ids": ",".join(self.coin_ids), "vs_currencies": "usd"}
-        resp = http_request_with_retry(
-            "GET", COINGECKO_PRICE_URL,
-            headers=headers, params=params, timeout=15,
-        )
-        if resp is None or resp.status_code != 200:
-            logging.error(
-                "CoinGecko 批量价格获取失败 status=%s body=%s",
-                getattr(resp, "status_code", None),
-                getattr(resp, "text", None)[:200],
+        fetched_any = False
+        # 分批请求，避免 ids 参数过长（URL 长度限制）
+        for i in range(0, len(self.coin_ids), PRICE_BATCH):
+            batch = self.coin_ids[i:i + PRICE_BATCH]
+            params = {"ids": ",".join(batch), "vs_currencies": "usd"}
+            resp = http_request_with_retry(
+                "GET", url,
+                headers=headers, params=params, timeout=15,
             )
-            return
-
-        try:
-            data = resp.json()
-            now = time.time()
-            fetched_any = False
-            for cid in self.coin_ids:
+            if resp is None or resp.status_code != 200:
+                logging.error(
+                    "CoinGecko 批量价格获取失败 status=%s body=%s",
+                    getattr(resp, "status_code", None),
+                    getattr(resp, "text", "")[:200],
+                )
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                logging.error("CoinGecko 价格响应非 JSON: %s",
+                              getattr(resp, "text", "")[:200])
+                continue
+            for cid in batch:
                 price_data = data.get(cid)
                 price_val = price_data.get("usd") if isinstance(price_data, dict) else None
                 if price_val is not None:
                     self._prices[cid] = float(price_val)
                     fetched_any = True
                 else:
-                    # CoinGecko 返回的 coin_id 无 usd 字段：保持旧值或 None
-                    if self._prices.get(cid) is None:
+                    # CoinGecko 返回的 coin_id 无 usd 字段：保持旧值或 None，只告警一次
+                    if self._prices.get(cid) is None and cid not in self._no_price_warned:
+                        self._no_price_warned.add(cid)
                         logging.warning("CoinGecko 未返回 %s.usd 字段（代币可能无 USD 价格）", cid)
-            if fetched_any:
-                self._fetched_at = now
-                logging.info("代币价格刷新: %s",
-                             ", ".join(f"{cid}=${self._prices[cid]:,.6f}"
-                                       for cid in self.coin_ids
-                                       if self._prices.get(cid) is not None))
-        except (ValueError, KeyError, TypeError) as e:
-            logging.exception("CoinGecko 批量价格解析失败: %s", e)
+
+        # 无论成败都推进刷新时间戳：若全量失败不推进，下一笔转账会立即再次
+        # 触发全量刷新（9 批 × 5 次退避重试，最长数分钟），造成主循环阻塞的
+        # 重试风暴。失败时保持旧缓存，等 TTL 到期后再试。
+        self._fetched_at = time.time()
+        ok = [cid for cid in self.coin_ids if self._prices.get(cid) is not None]
+        if fetched_any:
+            logging.info("代币价格刷新: %d/%d 个有价格，示例: %s",
+                         len(ok), len(self.coin_ids),
+                         ", ".join(f"{cid}=${self._prices[cid]:,.6f}" for cid in ok[:10]))
+        else:
+            logging.warning(
+                "CoinGecko 价格全量刷新失败（0/%d 个有价格），保持旧缓存，%ds 后重试",
+                len(self.coin_ids), self.ttl,
+            )
 
     def get_price_usd(self, coin_id: str) -> Optional[float]:
         """返回指定 coin_id 的 USD 单价。缓存过期则批量刷新全部。"""
@@ -644,6 +885,578 @@ class PriceOracle:
             self._fetch()
 
         return self._prices.get(coin_id)
+
+
+# ------------------------------------------------------------------
+# 代币市场数据 Oracle：流通市值 + 7d 日均成交量
+# ------------------------------------------------------------------
+
+class TokenMetricsOracle:
+    """从 CoinGecko 拉取代币流通市值与 7d 日均成交量，按 TTL 缓存。
+
+    设计要点：
+      - 流通市值通过 /coins/markets 批量拉取（per_page=250，分页），
+        覆盖 market_cap_usd / circulating_supply / total_supply / total_volume(24h)，
+        TTL=1h。
+      - 7d 日均成交量通过 /coins/{id}/market_chart?days=7&interval=daily 拉取，
+        800+ 币种全量拉取会触发限流，故采用懒加载：仅在该币种首次被
+        _handle_transfer 评估时拉一次，结果缓存 1h。下一轮监控如该币种
+        再次被命中，命中缓存直接返回，避免重复请求。
+      - 所有失败回退到 None / 旧缓存，不阻塞主流程。
+    """
+
+    def __init__(self, coin_ids: List[str], api_key: str, ttl_seconds: int = 3600):
+        self.coin_ids: List[str] = list(dict.fromkeys(
+            cid.strip() for cid in coin_ids if cid and cid.strip()
+        ))
+        self.api_key = api_key.strip() if api_key else ""
+        self.ttl = max(ttl_seconds, 300)
+        # 根据 key 类型选择域名（Pro key → pro-api.coingecko.com）
+        self._base_url = _cg_base_url(self.api_key)
+        self._markets_url = self._base_url + COINGECKO_MARKETS_PATH
+        # 批量字段
+        self._market_cap: Dict[str, Optional[float]] = {cid: None for cid in self.coin_ids}
+        self._circ_supply: Dict[str, Optional[float]] = {cid: None for cid in self.coin_ids}
+        self._volume_24h: Dict[str, Optional[float]] = {cid: None for cid in self.coin_ids}
+        self._fetched_at: float = 0.0
+        # 7d 均量懒加载缓存
+        self._volume_7d_avg: Dict[str, Optional[float]] = {}
+        self._volume_7d_fetched_at: Dict[str, float] = {}
+        # 7d 拉取异步化：主循环命中未缓存币种时立即返回（不阻塞），
+        # 请求入队由后台线程按限速串行拉取，同币种下次命中即有缓存。
+        self._fetch_queue: "queue.Queue[str]" = queue.Queue()
+        self._queued: set = set()
+        self._queued_lock = threading.Lock()
+        self._worker = threading.Thread(
+            target=self._volume_fetch_worker, daemon=True, name="cg-7d-worker",
+        )
+        self._worker.start()
+
+    def _headers(self) -> Dict[str, str]:
+        """按 key 类型生成正确的鉴权头（Pro key 用 x-cg-pro-api-key）。"""
+        h: Dict[str, str] = {"accept": "application/json"}
+        h.update(_cg_auth_header(self.api_key))
+        return h
+
+    def _fetch_markets(self) -> None:
+        """批量拉取所有 coin_id 的 markets 数据，按页合并。"""
+        if not self.coin_ids:
+            return
+        headers = self._headers()
+        url = self._markets_url
+        # 分批：URL 中 ids 参数过长会被服务端拒，按 MARKETS_PER_PAGE 分页
+        for i in range(0, len(self.coin_ids), MARKETS_PER_PAGE):
+            batch = self.coin_ids[i:i + MARKETS_PER_PAGE]
+            params = {
+                "vs_currency": "usd",
+                "ids": ",".join(batch),
+                "order": "market_cap_desc",
+                "per_page": MARKETS_PER_PAGE,
+                "page": 1,
+                "sparkline": "false",
+                "price_change_percentage": "",
+            }
+            resp = http_request_with_retry(
+                "GET", url,
+                headers=headers, params=params, timeout=20,
+            )
+            if resp is None or resp.status_code != 200:
+                logging.error(
+                    "CoinGecko markets 拉取失败 status=%s body=%s",
+                    getattr(resp, "status_code", None),
+                    getattr(resp, "text", "")[:200],
+                )
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                logging.error("CoinGecko markets 响应非 JSON: %s",
+                              getattr(resp, "text", "")[:200])
+                continue
+            if not isinstance(data, list):
+                continue
+            for item in data:
+                cid = item.get("id")
+                if not cid:
+                    continue
+                self._market_cap[cid] = item.get("market_cap")
+                self._circ_supply[cid] = item.get("circulating_supply")
+                self._volume_24h[cid] = item.get("total_volume")
+        self._fetched_at = time.time()
+        ok = [cid for cid in self.coin_ids if self._market_cap.get(cid) is not None]
+        logging.info("代币市场数据刷新: %d/%d 个有 market_cap", len(ok), len(self.coin_ids))
+
+    def _ensure_markets(self) -> None:
+        now = time.time()
+        if (now - self._fetched_at) >= self.ttl:
+            self._fetch_markets()
+
+    def _fetch_volume_7d(self, coin_id: str) -> None:
+        """懒加载拉取单个币种 7d daily volume，计算日均。"""
+        url = self._base_url + COINGECKO_MARKET_CHART_PATH.format(coin_id=coin_id)
+        params = {"vs_currency": "usd", "days": "7", "interval": "daily"}
+        resp = http_request_with_retry(
+            "GET", url, headers=self._headers(), params=params, timeout=20,
+        )
+        if resp is None or resp.status_code != 200:
+            logging.warning(
+                "CoinGecko market_chart 拉取失败 coin_id=%s status=%s",
+                coin_id, getattr(resp, "status_code", None),
+            )
+            # 失败时用 24h volume × 1.0 兜底（如果 markets 已拉取到）
+            self._volume_7d_avg[coin_id] = self._volume_24h.get(coin_id)
+            self._volume_7d_fetched_at[coin_id] = time.time()
+            return
+        try:
+            data = resp.json()
+        except ValueError:
+            self._volume_7d_avg[coin_id] = self._volume_24h.get(coin_id)
+            self._volume_7d_fetched_at[coin_id] = time.time()
+            return
+        volumes = data.get("total_volumes") or []
+        if not volumes or not isinstance(volumes, list):
+            self._volume_7d_avg[coin_id] = self._volume_24h.get(coin_id)
+            self._volume_7d_fetched_at[coin_id] = time.time()
+            return
+        # 每个 entry: [timestamp_ms, volume_usd]
+        vals = [v[1] for v in volumes if isinstance(v, list) and len(v) >= 2
+                and isinstance(v[1], (int, float))]
+        if not vals:
+            self._volume_7d_avg[coin_id] = self._volume_24h.get(coin_id)
+            self._volume_7d_fetched_at[coin_id] = time.time()
+            return
+        avg = sum(vals) / len(vals)
+        self._volume_7d_avg[coin_id] = float(avg)
+        self._volume_7d_fetched_at[coin_id] = time.time()
+        logging.debug("7d 日均成交量刷新 coin_id=%s avg=%.2f", coin_id, avg)
+
+    def _volume_fetch_worker(self) -> None:
+        """后台串行拉取队列中的 7d 均量，按限速间隔逐个处理（daemon，随进程退出）。"""
+        while True:
+            try:
+                coin_id = self._fetch_queue.get(timeout=5)
+            except queue.Empty:
+                continue
+            try:
+                try:
+                    self._fetch_volume_7d(coin_id)
+                except Exception:  # noqa: BLE001
+                    logging.exception("后台拉取 7d 均量异常 coin_id=%s", coin_id)
+            finally:
+                with self._queued_lock:
+                    self._queued.discard(coin_id)
+            # 限速间隔：CoinGecko demo 档 30 req/min，留余量
+            time.sleep(CG_7D_FETCH_INTERVAL)
+
+    def get_7d_avg_volume_usd(self, coin_id: str) -> Optional[float]:
+        """返回 7d 日均成交量（USD）。无 coin_id 或拉取失败返回 None。
+
+        非阻塞：缓存未命中/过期时将 coin_id 入队由后台线程刷新，
+        本次立即返回现有缓存（可能是 None 或 24h 兜底值）。
+        """
+        if not coin_id:
+            return None
+        self._ensure_markets()
+        now = time.time()
+        fetched = self._volume_7d_fetched_at.get(coin_id, 0.0)
+        if coin_id not in self._volume_7d_avg or (now - fetched) >= self.ttl:
+            with self._queued_lock:
+                if coin_id not in self._queued:
+                    self._queued.add(coin_id)
+                    self._fetch_queue.put(coin_id)
+        return self._volume_7d_avg.get(coin_id)
+
+    def get_7d_avg_volume_usd_cached(self, coin_id: str) -> Optional[float]:
+        """只读缓存版 7d 日均量：绝不发起网络请求 / 入队 / 刷新 markets。
+
+        供 AlertAggregator flush 兜底复查使用——flush 在主循环内执行，
+        若此处触发 _ensure_markets() 同步拉取（多页 + 重试退避）会阻塞
+        全部 7 条链的监控数分钟。入队刷新已由 _handle_transfer 完成，
+        这里只消费结果。
+        """
+        if not coin_id:
+            return None
+        return self._volume_7d_avg.get(coin_id)
+
+    def get_market_cap_usd(self, coin_id: str) -> Optional[float]:
+        self._ensure_markets()
+        return self._market_cap.get(coin_id)
+
+    def get_circulating_supply(self, coin_id: str) -> Optional[float]:
+        self._ensure_markets()
+        return self._circ_supply.get(coin_id)
+
+
+# ------------------------------------------------------------------
+# 排除地址库：交易所热钱包 / 做市商 / 稳定币增发地址
+# ------------------------------------------------------------------
+
+class ExcludedAddressStore:
+    """判断 from/to 是否为应排除的地址。
+
+    数据来源：
+      1) excluded_addresses.json（手动维护，结构见 excluded_addresses.example.json）
+         {
+           "exchange_hot": ["0x..."],
+           "market_makers": ["0x..."],
+           "stable_mint":  ["0x..."]
+         }
+      2) exchanges.json 标签关键词识别（与 ExchangeLabelStore 协作）：
+         - 标签含 wintermute / gsr / jump 等 → 做市商
+         - 标签含 treasury / mint / issuance  → 稳定币增发
+         - 标签含 hot wallet / operational    → 交易所热钱包
+         - 默认所有交易所地址（含 binance/okx 等关键词）视为热钱包（保守策略）
+    """
+
+    def __init__(
+        self,
+        local_path: str,
+        exchange_labels: Optional["ExchangeLabelStore"] = None,
+    ):
+        self.local_path = local_path
+        self.exchange_labels = exchange_labels
+        self._manual_sets: Dict[str, set] = {
+            "exchange_hot": set(),
+            "market_makers": set(),
+            "stable_mint": set(),
+        }
+        # 标签关键词命中后归类，all_excluded 是合并集合用于快速 is_excluded 判断
+        self._all_excluded: set = set()
+        self._load_file()
+
+    def _load_file(self) -> None:
+        if not os.path.exists(self.local_path):
+            logging.info("排除地址文件 %s 不存在（仅靠 exchanges.json 标签识别）", self.local_path)
+            return
+        try:
+            with open(self.local_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            logging.exception("排除地址文件 %s 解析失败", self.local_path)
+            return
+        if not isinstance(data, dict):
+            return
+        for key in self._manual_sets:
+            addrs = data.get(key) or []
+            if isinstance(addrs, list):
+                for a in addrs:
+                    a = str(a).lower().strip()
+                    if a.startswith("0x") and len(a) == 42:
+                        self._manual_sets[key].add(a)
+        logging.info(
+            "排除地址文件加载: exchange_hot=%d, market_makers=%d, stable_mint=%d",
+            len(self._manual_sets["exchange_hot"]),
+            len(self._manual_sets["market_makers"]),
+            len(self._manual_sets["stable_mint"]),
+        )
+
+    def _label_category(self, label: str) -> Optional[str]:
+        """根据 exchanges.json 标签判断该地址属于哪类排除地址。"""
+        if not label:
+            return None
+        low = label.lower()
+        # 优先匹配更具体的：稳定币增发 > 做市商 > 交易所热钱包
+        if any(kw in low for kw in STABLE_MINT_KEYWORDS):
+            return "stable_mint"
+        if any(kw in low for kw in MARKET_MAKER_KEYWORDS):
+            return "market_makers"
+        # 交易所地址默认视为热钱包（除非显式标识为 cold/deposit/withdraw 钱包）
+        # 这里使用 EXCHANGE_KEYWORDS（与主流程一致），匹配即视为热钱包
+        if any(kw in low for kw in EXCHANGE_KEYWORDS):
+            # 但若标签含 cold/cold wallet，则不视为热钱包
+            if "cold" in low or "storage" in low:
+                return None
+            return "exchange_hot"
+        if any(kw in low for kw in EXCHANGE_HOT_KEYWORDS):
+            return "exchange_hot"
+        return None
+
+    # 仅排除做市商和稳定币增发地址；交易所热钱包不再排除
+    # （交易所地址需参与推送门槛判断，见主流程）
+    _EXCLUDED_CATEGORIES = ("market_makers", "stable_mint")
+
+    def is_excluded(self, address: str) -> bool:
+        """判断地址是否在排除名单内（仅做市商 / 稳定币增发）。"""
+        if not address:
+            return False
+        addr = address.lower()
+        for cat in self._EXCLUDED_CATEGORIES:
+            if addr in self._manual_sets.get(cat, set()):
+                return True
+        if self.exchange_labels is not None:
+            label = self.exchange_labels.lookup(address)
+            if label:
+                cat = self._label_category(label)
+                if cat and cat in self._EXCLUDED_CATEGORIES:
+                    return True
+        return False
+
+    def exclusion_reason(self, address: str) -> Optional[str]:
+        """返回排除原因（用于日志），未排除返回 None。"""
+        if not address:
+            return None
+        addr = address.lower()
+        for cat in self._EXCLUDED_CATEGORIES:
+            if addr in self._manual_sets.get(cat, set()):
+                return cat
+        if self.exchange_labels is not None:
+            label = self.exchange_labels.lookup(address)
+            if label:
+                cat = self._label_category(label)
+                if cat and cat in self._EXCLUDED_CATEGORIES:
+                    return f"{cat}(label={label})"
+        return None
+
+
+# ------------------------------------------------------------------
+# 告警合并 / 冷却：5 分钟合并窗口 + 10 分钟同地址冷却
+# ------------------------------------------------------------------
+
+class AlertAggregator:
+    """同 (chain,symbol,from,to) 短时多次转账合并为一条告警；同地址冷却去重。
+
+    工作流：
+      1) offer(entry) 把单笔转账放入对应桶；若 from 或 to 在冷却期内直接丢弃
+      2) flush() 扫描所有桶，到期（first_seen + MERGE_WINDOW_SECONDS）的桶：
+         - 按 R 值重新计算严重度（基于累计金额）
+         - 推送飞书
+         - 把 from / to 加入冷却（COOLDOWN_SECONDS）
+      3) 主循环每隔 AGGREGATOR_FLUSH_INTERVAL 秒调一次 flush
+
+    注意：Aggregator 不做已告警 tx_hash 去重（由 TransferMonitor._already_alerted 负责），
+         只做时间窗合并与同地址冷却。
+    """
+
+    def __init__(self, send_fn, metrics_getter=None):
+        # send_fn 签名: send_fn(chain, symbol, from_addr, to_addr, from_label, to_label,
+        #                       total_amount, total_usd, ratio_r, mcap_ratio, severity,
+        #                       tx_hashes, tx_link_prefix) -> bool
+        self._send_fn = send_fn
+        # metrics_getter(coin_id) -> Optional[float]：flush 时兜底重查 7d 均量。
+        # 必须是只读缓存版（get_7d_avg_volume_usd_cached），绝不能触发网络请求。
+        # 7d 拉取已异步化，入桶时可能还是 None/24h 兜底，flush 距入桶至少一个
+        # 合并窗口（5 分钟），后台线程大概率已完成拉取，此时重查可恢复精确分级。
+        self._metrics_getter = metrics_getter
+        # bucket_key: (chain, symbol, from_addr_lower, to_addr_lower)
+        #   value: { first_seen, last_seen, total_amount, total_usd,
+        #            tx_hashes: [str], coin_id, price, volume_7d, market_cap }
+        self._buckets: Dict[tuple, Dict[str, Any]] = {}
+        # cooldown: (chain, address_lower) -> cooldown_until_ts
+        self._cooldown: Dict[tuple, float] = {}
+        self._last_flush = 0.0
+
+    def _in_cooldown(self, chain: str, address: str) -> bool:
+        key = (chain, address.lower())
+        until = self._cooldown.get(key, 0.0)
+        return time.time() < until
+
+    def _set_cooldown(self, chain: str, address: str) -> None:
+        self._cooldown[(chain, address.lower())] = time.time() + COOLDOWN_SECONDS
+
+    def offer(
+        self,
+        chain: str,
+        symbol: str,
+        coin_id: str,
+        from_addr: str,
+        to_addr: str,
+        from_label: Optional[str],
+        to_label: Optional[str],
+        amount: float,
+        usd_value: float,
+        price: float,
+        volume_7d: Optional[float],
+        market_cap: Optional[float],
+        tx_hash: str,
+        block: int,
+    ) -> bool:
+        """提交一笔转账进入合并桶。返回 True 表示已入桶，False 表示被冷却丢弃。"""
+        # 同地址冷却：from 或 to 任一在冷却期则丢弃
+        if self._in_cooldown(chain, from_addr) or self._in_cooldown(chain, to_addr):
+            logging.info(
+                "[冷却丢弃] %s@%s tx=%s usd=%.2f from=%s to=%s 在冷却期内",
+                symbol, chain, tx_hash, usd_value, from_addr, to_addr,
+            )
+            return False
+
+        key = (chain, symbol, from_addr.lower(), to_addr.lower())
+        now = time.time()
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            bucket = {
+                "first_seen": now,
+                "last_seen": now,
+                "total_amount": 0.0,
+                "total_usd": 0.0,
+                "tx_hashes": [],
+                "coin_id": coin_id,
+                "price": price,
+                "volume_7d": volume_7d,
+                "market_cap": market_cap,
+                "from_addr": from_addr,
+                "to_addr": to_addr,
+                "from_label": from_label,
+                "to_label": to_label,
+                "block_first": block,
+                "block_last": block,
+            }
+            self._buckets[key] = bucket
+        bucket["last_seen"] = now
+        bucket["total_amount"] += amount
+        bucket["total_usd"] += usd_value
+        bucket["tx_hashes"].append(tx_hash)
+        bucket["block_last"] = block
+        # 同一桶内若新 transfer 拿到更新的 volume/mcap，更新之（懒加载可能导致后续才有值）
+        if volume_7d is not None and bucket.get("volume_7d") is None:
+            bucket["volume_7d"] = volume_7d
+        if market_cap is not None and bucket.get("market_cap") is None:
+            bucket["market_cap"] = market_cap
+        return True
+
+    def flush(self, force: bool = False) -> int:
+        """扫描到期桶并推送。返回本次推送的告警数。
+
+        推送失败时桶保留（同桶最多 MAX_ALERT_PUSH_ATTEMPTS 次尝试），
+        下轮 flush 重试，期间新到账转账仍可并入；超过上限放弃并丢弃，
+        避免飞书长时间不可用时桶无限堆积、主循环反复阻塞。
+        """
+        now = time.time()
+        if not force and (now - self._last_flush) < AGGREGATOR_FLUSH_INTERVAL:
+            return 0
+        self._last_flush = now
+
+        sent = 0
+        expired_keys = []
+        for key, bucket in list(self._buckets.items()):
+            age = now - bucket["first_seen"]
+            if age < MERGE_WINDOW_SECONDS and not force:
+                continue
+            expired_keys.append(key)
+            chain, symbol, _, _ = key
+
+            # ---- flush 时刻复查冷却 ----
+            # 桶可能在冷却生效前入桶（入桶时双方均无冷却），但入桶后另一
+            # 桶推送成功把 from/to 置入冷却。此时本桶若直接推送会造成同
+            # 地址 10 分钟内重复告警，因此推送前必须复查并丢弃。
+            if self._in_cooldown(chain, bucket["from_addr"]) or self._in_cooldown(chain, bucket["to_addr"]):
+                logging.info(
+                    "[冷却丢弃] %s@%s 累计 usd=%.2f 入桶后同地址已推送（%s / %s 任一在冷却期）",
+                    symbol, chain, bucket["total_usd"],
+                    bucket.get("from_label") or bucket["from_addr"][:10],
+                    bucket.get("to_label") or bucket["to_addr"][:10],
+                )
+                continue
+
+            total_usd = bucket["total_usd"]
+            total_amount = bucket["total_amount"]
+            volume_7d = bucket.get("volume_7d")
+            market_cap = bucket.get("market_cap")
+            # 7d 异步拉取兜底：入桶时值可能还没到（None），此时重查一次
+            # （非阻塞，只读缓存）；取到则用精确值分级，仍取不到按无可靠量兜底
+            if volume_7d is None and self._metrics_getter and bucket.get("coin_id"):
+                try:
+                    volume_7d = self._metrics_getter(bucket["coin_id"])
+                except Exception:  # noqa: BLE001
+                    volume_7d = None
+
+            # ---- 重新计算严重度 ----
+            # 数据可靠性兜底：vol7d 异常小（< MIN_VOLUME_RELIABLE_USD）说明该币种
+            # 公开市场无交易量，CoinGecko 数据不可信，不应用 R 值分级（否则会因分母
+            # 极小而误判为 critical）。market_cap=0 同样视为不可靠。
+            volume_reliable = bool(volume_7d and volume_7d >= MIN_VOLUME_RELIABLE_USD)
+            mcap_reliable = bool(market_cap and market_cap > 0)
+
+            if not volume_reliable:
+                # 无法可靠计算 R：累计金额仍 ≥ MIN_PUSH_USD 才推（用普通级）
+                # 注意 _handle_transfer 已经过滤 USD < MIN_PUSH_USD 的单笔，
+                # 这里 total_usd 是合并累计，至少有一笔 ≥ MIN_PUSH_USD 才会入桶
+                if total_usd < MIN_PUSH_USD:
+                    logging.info(
+                        "[合并丢弃] %s@%s 累计 usd=%.2f 无可靠 7d 均量(vol=%s)且 < MIN_PUSH",
+                        symbol, chain, total_usd,
+                        f"{volume_7d:.2f}" if volume_7d else "None",
+                    )
+                    continue
+                severity = "normal"
+                ratio_r = None
+                mcap_ratio = None
+            else:
+                ratio_r = total_usd / volume_7d
+                mcap_ratio = (total_usd / market_cap) if mcap_reliable else 0.0
+                # 分级（严格按用户规则）：
+                #   R < 0.5%        → 不推送（continue）
+                #   0.5% ≤ R < 2%   → 普通
+                #   2%   ≤ R < 5%   → 重要
+                #   R ≥ 5%          → 严重
+                #   或 amount ≥ 1% 流通市值 → 严重
+                if ratio_r < SEVERITY_RATIO_NORMAL_MIN:
+                    logging.info(
+                        "[R 不足] %s@%s 累计 usd=%.2f R=%.4f < %.4f 不推送",
+                        symbol, chain, total_usd, ratio_r, SEVERITY_RATIO_NORMAL_MIN,
+                    )
+                    continue
+                elif ratio_r < SEVERITY_RATIO_IMPORTANT_MIN:
+                    severity = "normal"
+                elif ratio_r < SEVERITY_RATIO_CRITICAL_MIN:
+                    severity = "important"
+                else:
+                    severity = "critical"
+                # 流通市值 1% 直接严重
+                if mcap_ratio >= SEVERITY_MCAP_CRITICAL_RATIO:
+                    severity = "critical"
+
+            tx_hashes = bucket["tx_hashes"]
+            ok = self._send_fn(
+                chain=chain,
+                symbol=symbol,
+                from_addr=bucket["from_addr"],
+                to_addr=bucket["to_addr"],
+                from_label=bucket.get("from_label"),
+                to_label=bucket.get("to_label"),
+                total_amount=total_amount,
+                total_usd=total_usd,
+                ratio_r=ratio_r,
+                mcap_ratio=mcap_ratio,
+                severity=severity,
+                tx_hashes=tx_hashes,
+                block_first=bucket["block_first"],
+                block_last=bucket["block_last"],
+                coin_id=bucket.get("coin_id", ""),
+                price=bucket.get("price"),
+            )
+            if ok:
+                sent += 1
+                # 推送成功 → from / to 进入冷却
+                self._set_cooldown(chain, bucket["from_addr"])
+                self._set_cooldown(chain, bucket["to_addr"])
+            else:
+                # 推送失败：保留桶等下轮 flush 重试（此前已 append 进 expired_keys）
+                bucket["push_attempts"] = bucket.get("push_attempts", 0) + 1
+                if bucket["push_attempts"] < MAX_ALERT_PUSH_ATTEMPTS:
+                    expired_keys.remove(key)
+                    logging.warning(
+                        "[推送失败重试] %s@%s 累计 usd=%.2f 第 %d/%d 次失败，桶保留待下轮重试",
+                        symbol, chain, total_usd,
+                        bucket["push_attempts"], MAX_ALERT_PUSH_ATTEMPTS,
+                    )
+                else:
+                    logging.error(
+                        "[推送放弃] %s@%s 累计 usd=%.2f 连续 %d 次推送失败，丢弃桶（需人工核查飞书配置/网络）",
+                        symbol, chain, total_usd, bucket["push_attempts"],
+                    )
+
+        for k in expired_keys:
+            self._buckets.pop(k, None)
+
+        # 清理过期冷却项，防止字典无限增长
+        if self._cooldown:
+            stale = [k for k, until in self._cooldown.items() if until <= now]
+            for k in stale:
+                self._cooldown.pop(k, None)
+
+        if sent:
+            logging.info("[Aggregator] flush 推送 %d 条告警，剩余桶 %d 个", sent, len(self._buckets))
+        return sent
 
 
 # ------------------------------------------------------------------
@@ -743,14 +1556,19 @@ def init_rpc(rpc_url: str) -> EthRpcClient:
 
 
 def get_token_decimals(rpc: EthRpcClient, token_address: str, fallback: int) -> int:
-    """读取代币合约 decimals()。若调用失败则使用 fallback。"""
-    if fallback and fallback > 0:
-        return fallback
+    """读取代币合约 decimals()，RPC 优先；失败或非法值时使用 fallback（<=0 视为 18）。"""
     decimals = rpc.call_decimals(token_address)
-    if decimals is not None:
+    if decimals is not None and decimals > 0:
         return decimals
-    logging.warning("读取 decimals() 失败，使用 fallback=%d", fallback)
-    return fallback if fallback > 0 else 18
+    fb = fallback if fallback > 0 else 18
+    logging.warning("读取 decimals() 失败（%s），使用 fallback=%d", token_address, fb)
+    return fb
+
+
+# eth_getLogs 的 address 数组分批大小。
+# 全量币种模式下单链可能有数百个合约，部分 RPC 节点对 address 数组数量 /
+# 请求体大小有限制，分批拉取后合并更稳妥。
+GETLOGS_ADDR_CHUNK = 50
 
 
 def fetch_transfer_logs(
@@ -759,15 +1577,21 @@ def fetch_transfer_logs(
     """拉取 [from_block, to_block] 区间内多个代币合约的 Transfer 事件日志。
 
     JSON-RPC 一次 eth_getLogs 可传 address 数组: ["0xaaa...", "0xbbb..."]，
-    比分别调用更高效。返回的每条 log 自带 address 字段，可区分是哪个代币。
+    比分别调用更高效；合约数量过多时按 GETLOGS_ADDR_CHUNK 分批后合并结果。
+    返回的每条 log 自带 address 字段，可区分是哪个代币。
     """
     if not token_addresses:
         return []
-    if len(token_addresses) == 1:
-        # 单合约时直接传字符串（部分 RPC 节点对数组兼容性差）
-        return rpc.get_logs(from_block, to_block, token_addresses[0], [TRANSFER_EVENT_TOPIC])
-    else:
-        return rpc.get_logs(from_block, to_block, token_addresses, [TRANSFER_EVENT_TOPIC])
+    all_logs: List[Dict[str, Any]] = []
+    for i in range(0, len(token_addresses), GETLOGS_ADDR_CHUNK):
+        chunk = token_addresses[i:i + GETLOGS_ADDR_CHUNK]
+        if len(chunk) == 1:
+            # 单合约时直接传字符串（部分 RPC 节点对数组兼容性差）
+            logs = rpc.get_logs(from_block, to_block, chunk[0], [TRANSFER_EVENT_TOPIC])
+        else:
+            logs = rpc.get_logs(from_block, to_block, chunk, [TRANSFER_EVENT_TOPIC])
+        all_logs.extend(logs)
+    return all_logs
 
 
 def _topic_to_address(topic: Any) -> str:
@@ -856,25 +1680,37 @@ def send_feishu_alert(
     content_lines: List[str],
     link: str,
     secret: Optional[str] = None,
+    severity: str = "normal",
 ) -> bool:
     """组装飞书交互式卡片消息并 POST 到 webhook。
     成功返回 True。失败返回 False（不阻塞主循环，下一轮还会尝试但会被去重）。
 
     Args:
         webhook_url: 飞书机器人 webhook URL
-        title: 卡片标题
+        title: 卡片标题（不含严重度前缀，前缀由 severity 自动添加）
         content_lines: 正文行列表
-        link: 交易浏览器链接（卡片底部按钮）
+        link: 交易浏览器链接（卡片底部按钮，单笔转账主链接）
         secret: 签名密钥（可选，仅当机器人开启签名校验时传入）
+        severity: 严重度 normal / important / critical，决定卡片颜色与标题 emoji
     """
-    # 卡片正文：每行一段 + 末尾交易链接
+    # 严重度 → (前缀 emoji, 卡片 template 颜色)
+    severity_style = {
+        "critical":  ("🚨🚨 [严重] ", "red"),
+        "important": ("⚠️ [重要] ",  "orange"),
+        "normal":    ("ℹ️ [普通] ",  "blue"),
+    }
+    prefix, template = severity_style.get(severity, severity_style["normal"])
+    full_title = prefix + title
+
+    # 卡片正文：每行一段
     content_elements = [{"tag": "div", "text": {"tag": "lark_md",
                           "content": "\n".join(content_lines)}}]
+    # 末尾主交易链接按钮
     content_elements.append({
         "tag": "action",
         "actions": [{
             "tag": "button",
-            "text": {"tag": "plain_text", "content": "查看交易 ↗"},
+            "text": {"tag": "plain_text", "content": "查看主交易 ↗"},
             "type": "primary",
             "url": link,
         }],
@@ -884,8 +1720,8 @@ def send_feishu_alert(
         "msg_type": "interactive",
         "card": {
             "header": {
-                "title": {"tag": "plain_text", "content": title},
-                "template": "red",
+                "title": {"tag": "plain_text", "content": full_title},
+                "template": template,
             },
             "elements": content_elements,
         },
@@ -906,7 +1742,7 @@ def send_feishu_alert(
     if resp is None or resp.status_code != 200:
         logging.error("飞书 webhook 推送失败 status=%s body=%s",
                       getattr(resp, "status_code", None),
-                      getattr(resp, "text", None)[:200])
+                      getattr(resp, "text", "")[:200])
         return False
     # 飞书成功时返回 {"StatusCode":0} 或 {"code":0}
     try:
@@ -951,6 +1787,8 @@ class TransferMonitor:
             self.rpcs = {self.chains[0]: init_rpc(self.config["rpc_url"])}
 
         # 全局阈值 / 轮询参数
+        # alert_usd_threshold 为历史遗留字段（仅兼容旧配置保留，不参与推送判断，
+        # 推送门槛见代码常量 MIN_PUSH_USD）；dust_threshold 仍生效
         self.alert_threshold = float(self.config.get("alert_usd_threshold", 100_000))
         self.dust_threshold = float(self.config.get("dust_usd_threshold", 100))
         self.confirmations = int(self.config.get("confirmations", 6))
@@ -968,12 +1806,19 @@ class TransferMonitor:
                     f"chain={t['chain']} 未配置对应 RPC 节点"
                 )
 
-        # 用各自链的 rpc 修正 decimals（若 config 填了 0）
-        for t in self.tokens:
-            if t["decimals"] == 0:
-                t["decimals"] = get_token_decimals(
-                    self.rpcs[t["chain"]], t["contract"], fallback=18
-                )
+        # 用各自链的 rpc 修正 decimals（config 填 0 表示运行时自动获取）。
+        # 全量币种模式下可能有数百个合约，串行 eth_call 启动太慢，线程池并发拉取；
+        # RPC 失败的才用 fallback=18。
+        pending = [t for t in self.tokens if t["decimals"] == 0]
+        if pending:
+            def _fetch_decimals(tok: Dict[str, Any]) -> int:
+                d = self.rpcs[tok["chain"]].call_decimals(tok["contract"])
+                return d if (d is not None and d > 0) else 18
+
+            with ThreadPoolExecutor(max_workers=10) as ex:
+                for tok, dec in zip(pending, ex.map(_fetch_decimals, pending)):
+                    tok["decimals"] = dec
+            logging.info("自动获取 decimals 完成：%d 个合约（失败回退 18）", len(pending))
 
         # 按链分组 tokens + 构建合约地址 → token 映射（每条链独立一份）
         self.tokens_by_chain: Dict[str, List[Dict[str, Any]]] = {
@@ -1002,10 +1847,21 @@ class TransferMonitor:
         )
         self.exchanges.init()
 
+        # 排除地址库：交易所热钱包 / 做市商 / 稳定币增发地址
+        # 完全替换原"仅交易所地址才推送"规则：现在任何地址都按 R 值评估，
+        # 但凡 from/to 命中排除名单（含 exchanges.json 标签识别）则直接丢弃。
+        self.excluded_addresses = ExcludedAddressStore(
+            local_path=self.config.get("excluded_addresses_file", DEFAULT_EXCLUDED_ADDRESSES_FILE),
+            exchange_labels=self.exchanges,
+        )
+
         # 状态文件：按 chain 分桶（v2 格式），兼容旧 v1 单链状态自动迁移
         self.state_file = self.config.get("state_file", DEFAULT_STATE_FILE)
+        # v1 单链旧状态仅在单链模式下继承（多链下无法归属链，见 load_chain_state）
         self.states: Dict[str, Dict[str, Any]] = {
-            chain: load_chain_state(self.state_file, chain) for chain in self.chains
+            chain: load_chain_state(self.state_file, chain,
+                                    allow_v1_inherit=not self.multi_chain_mode)
+            for chain in self.chains
         }
 
         self.feishu_webhook = self.config.get("feishu_webhook_url", "")
@@ -1023,6 +1879,21 @@ class TransferMonitor:
         self.state = self.states[self.chains[0]]
         self._contract_to_token = self._contract_to_token_by_chain[self.chains[0]]
         self.tx_link_prefix = self.tx_link_prefixes[self.chains[0]]
+
+        # ---- TokenMetricsOracle：流通市值 + 7d 日均成交量（懒加载） ----
+        self.metrics_oracle = TokenMetricsOracle(
+            coin_ids=all_coin_ids,
+            api_key=self.config.get("coingecko_api_key", ""),
+            ttl_seconds=int(self.config.get("metrics_cache_ttl_seconds", 3600)),
+        )
+
+        # ---- AlertAggregator：5 分钟合并窗口 + 10 分钟同地址冷却 ----
+        # send_fn 由本类的 _emit_aggregated_alert 实现（闭包绑定 webhook / secret / prefix）
+        self.aggregator = AlertAggregator(
+            send_fn=self._emit_aggregated_alert,
+            # flush 兜底重查必须用只读缓存版：主循环内禁止同步网络请求
+            metrics_getter=self.metrics_oracle.get_7d_avg_volume_usd_cached,
+        )
 
         # 打印初始化摘要
         logging.info(
@@ -1057,8 +1928,9 @@ class TransferMonitor:
                 root.addHandler(sh)
             except (OSError, ValueError):
                 pass  # stdout 无效，跳过 StreamHandler
-        # 文件（追加，作为本地告警留痕）
-        fh = logging.FileHandler(log_file, encoding="utf-8")
+        # 文件（轮转写入，作为本地告警留痕；单文件 50MB，保留 3 个备份）
+        fh = RotatingFileHandler(log_file, maxBytes=50 * 1024 * 1024,
+                                 backupCount=3, encoding="utf-8")
         fh.setFormatter(logging.Formatter(fmt))
         root.addHandler(fh)
 
@@ -1079,15 +1951,25 @@ class TransferMonitor:
 
     # ---- 单笔转账处理 ----
     def _handle_transfer(self, t: Dict[str, Any], token_info: Dict[str, Any]) -> None:
-        """处理单笔转账。
+        """处理单笔转账（新告警分级逻辑）。
+
+        新流程：
+          1) tx_hash 去重
+          2) 价格获取 → USD 价值
+          3) dust_threshold 灰尘过滤（保留作为极端小额过滤）
+          4) skip_alert（USDT/USDC）跳过
+          5) 排除地址过滤（交易所热钱包 / 做市商 / 稳定币增发）→ 命中即丢弃
+          6) USD < 50000 直接丢弃（金额硬下限）
+          7) 抓 7d 日均量 / 流通市值，丢给 AlertAggregator 合并
+          8) flush 时由 Aggregator 重新计算 R 值分级并推送
 
         Args:
             t: parse_transfer_log 的返回值
-            token_info: 该代币的标准化配置 dict（含 contract / decimals / symbol / coingecko_id / alert_threshold / dust_threshold）
+            token_info: 该代币的标准化配置 dict
         """
         tx_hash = t["tx_hash"]
         chain = token_info["chain"]
-        # 防重复告警
+        # 防重复告警（tx 级去重，由 TransferMonitor 持久化负责）
         if self._already_alerted(chain, tx_hash):
             return
 
@@ -1096,96 +1978,205 @@ class TransferMonitor:
         coin_id = token_info.get("coingecko_id", "")
         price = self.price_oracle.get_price_usd(coin_id) if coin_id else None
         if price is None:
-            # 价格获取失败时跳过本轮（下一轮还会重新拉到，因为有去重所以不会漏）
-            # 若无 coingecko_id（可能是无价格的新币），也跳过 USD 换算告警
+            # 注意：区块区间随主循环持续推进，这里 return 后该笔不会重扫，
+            # 即告警放弃（价格恢复后的新转账不受影响）。不标记已告警，
+            # 仅保留状态回退 / 手动重扫时可再处理的可能。
             if coin_id:
-                logging.warning("价格不可用 %s，跳过 tx=%s，下一轮重试", token_info["symbol"], tx_hash)
+                logging.warning("价格不可用 %s，放弃 tx=%s（区间已推进不重扫）",
+                                token_info["symbol"], tx_hash)
             return
         usd_value = amount * price
 
-        # 灰尘过滤（用代币自己的 dust_threshold，回退全局）
+        # 灰尘过滤（保留作为极端小额过滤；新的金额硬下限 MIN_PUSH_USD=50000 也起作用）
         dust_th = token_info.get("dust_threshold") or self.dust_threshold
-        alert_th = token_info.get("alert_threshold") or self.alert_threshold
         if usd_value < dust_th:
-            return
-        if usd_value < alert_th:
             return
 
         # 若该代币标记了 skip_alert，仅记录金额到日志，不推送飞书也不标记已告警
         if token_info.get("skip_alert"):
-            logging.info("[SKIP_ALERT] %s tx=%s usd=%.2f 达到阈值但配置了跳过告警",
+            logging.info("[SKIP_ALERT] %s tx=%s usd=%.2f 配置了跳过告警",
                          token_info["symbol"], tx_hash, usd_value)
             return
 
-        # 交易所识别
-        to_label = self.exchanges.lookup(t["to"])
-        from_label = self.exchanges.lookup(t["from"])
+        # ---- 排除地址过滤（替换原"仅交易所地址才推送"规则）----
+        # exchanges.json 标签识别 + excluded_addresses.json 手动清单
+        from_addr = t["from"]
+        to_addr = t["to"]
+        from_excl = self.excluded_addresses.exclusion_reason(from_addr)
+        to_excl = self.excluded_addresses.exclusion_reason(to_addr)
+        if from_excl or to_excl:
+            logging.info(
+                "[排除地址] %s@%s tx=%s usd=%.2f from=%s(%s) to=%s(%s) 命中排除名单",
+                token_info["symbol"], chain, tx_hash, usd_value,
+                from_addr[:12], from_excl or "OK",
+                to_addr[:12], to_excl or "OK",
+            )
+            # 仍标记已告警，避免后续重复处理（这些地址的转账通常频繁）
+            self._mark_alerted(chain, tx_hash)
+            return
 
-        # 组装告警消息（tx_link_prefix 按代币所在链取）
-        tx_link = self.tx_link_prefixes[chain] + tx_hash
+        # ---- 金额硬下限：USD < 50000 不推送 ----
+        if usd_value < MIN_PUSH_USD:
+            logging.info(
+                "[金额不足] %s@%s tx=%s usd=%.2f < MIN_PUSH=%.2f",
+                token_info["symbol"], chain, tx_hash, usd_value, MIN_PUSH_USD,
+            )
+            return
+
+        # ---- 交易所门槛：任一方是交易所(CEX/DEX)才推送；双方都是 CEX 才跳过 ----
+        # DEX↔CEX / DEX↔DEX 均推送（链上大额资金进出 DEX 也是关键信号）
+        from_label = self.exchanges.lookup(from_addr)
+        to_label = self.exchanges.lookup(to_addr)
+        from_is_exch = _is_exch(from_label)
+        to_is_exch = _is_exch(to_label)
+        from_is_cex = _is_cex(from_label)
+        to_is_cex = _is_cex(to_label)
         symbol = token_info["symbol"]
-        title = f"[{chain.upper()}] 大额 {symbol} 转账 ${usd_value:,.2f}"
-        lines = [
-            f"**链**: {chain}",
-            f"**代币**: {symbol}",
-            f"**数量**: {amount:,.4f}",
-            f"**USD 价值**: ${usd_value:,.2f}",
-            f"**发送方**: `{t['from']}`" + (f" ({from_label})" if from_label else ""),
-            f"**接收方**: `{t['to']}`" + (f" ({to_label})" if to_label else ""),
-            f"**区块**: {t['block']}",
-            f"**TxHash**: `{tx_hash}`",
-        ]
-        # 发送方/接收方标签分类提示
-        # exchanges.json 中可能含非交易所标签（如巨鲸、跨链桥、机构），
-        # 通过交易所关键词判断是否为交易所地址，区分显示逻辑。
-        EXCHANGE_KEYWORDS = (
-            "binance", "okx", "okex", "coinbase", "kraken", "bybit",
-            "bitfinex", "huobi", "kucoin", "gate", "mexc", "bitget",
-            "upbit", "bithumb", "poloniex", "gemini", "crypto.com",
-            "ftx", "bittrex", "bitstamp", "deribit", "bitmex",
+        if not (from_is_exch or to_is_exch):
+            logging.info(
+                "[非交易所] %s@%s tx=%s usd=%.2f from=%s to=%s 双方均非交易所，跳过",
+                symbol, chain, tx_hash, usd_value, from_addr[:12], to_addr[:12],
+            )
+            self._mark_alerted(chain, tx_hash)
+            return
+        if from_is_cex and to_is_cex:
+            logging.info(
+                "[CEX互转] %s@%s tx=%s usd=%.2f from=%s(%s) to=%s(%s) 双方均为CEX，跳过",
+                symbol, chain, tx_hash, usd_value,
+                from_addr[:12], from_label, to_addr[:12], to_label,
+            )
+            self._mark_alerted(chain, tx_hash)
+            return
+
+        # ---- 抓 7d 日均量 + 流通市值（仅通过门槛的才拉取，节省 API 调用）----
+        volume_7d = self.metrics_oracle.get_7d_avg_volume_usd(coin_id) if coin_id else None
+        market_cap = self.metrics_oracle.get_market_cap_usd(coin_id) if coin_id else None
+        logging.info(
+            "[入桶] %s@%s tx=%s usd=%.2f from=%s to=%s vol7d=%s mcap=%s",
+            symbol, chain, tx_hash, usd_value, from_addr[:12], to_addr[:12],
+            f"{volume_7d:,.0f}" if volume_7d else "N/A",
+            f"{market_cap:,.0f}" if market_cap else "N/A",
         )
 
-        def _is_exchange(label: str) -> bool:
+        # 提交给 Aggregator：5 分钟合并 + 10 分钟冷却（被冷却丢弃时返回 False，无需处理）
+        self.aggregator.offer(
+            chain=chain,
+            symbol=symbol,
+            coin_id=coin_id,
+            from_addr=from_addr,
+            to_addr=to_addr,
+            from_label=from_label,
+            to_label=to_label,
+            amount=amount,
+            usd_value=usd_value,
+            price=price,
+            volume_7d=volume_7d,
+            market_cap=market_cap,
+            tx_hash=tx_hash,
+            block=t["block"],
+        )
+        # 标记已告警，防止该 tx 在下一轮被重复入桶（即使 Aggregator 还没 flush）。
+        # 被冷却丢弃（accepted=False）同样标记为已处理，避免状态回退/重扫时反复入桶刷日志
+        self._mark_alerted(chain, tx_hash)
+
+    # ---- Aggregator 回调：组装飞书卡片并推送 ----
+    def _emit_aggregated_alert(
+        self,
+        chain: str,
+        symbol: str,
+        from_addr: str,
+        to_addr: str,
+        from_label: Optional[str],
+        to_label: Optional[str],
+        total_amount: float,
+        total_usd: float,
+        ratio_r: Optional[float],
+        mcap_ratio: Optional[float],
+        severity: str,
+        tx_hashes: List[str],
+        block_first: int,
+        block_last: int,
+        coin_id: str,
+        price: Optional[float],
+    ) -> bool:
+        """AlertAggregator.flush 调用的 send_fn：构造卡片并推送飞书。
+
+        Args 见 AlertAggregator.offer / flush。返回 True 表示推送成功。
+        """
+        tx_link_prefix = self.tx_link_prefixes.get(chain, EXPLORER_TX_PREFIX["ethereum"])
+        primary_tx = tx_hashes[0] if tx_hashes else ""
+        primary_link = tx_link_prefix + primary_tx
+
+        # 标题（不含严重度前缀，前缀由 send_feishu_alert 按 severity 自动加）
+        title = f"{symbol} 大额转账 ${total_usd:,.2f}"
+
+        # 严重度中文展示
+        severity_cn = {"critical": "严重", "important": "重要", "normal": "普通"}.get(severity, "普通")
+        ratio_pct = f"{ratio_r*100:.3f}%" if ratio_r is not None else "N/A"
+        mcap_pct = f"{mcap_ratio*100:.4f}%" if mcap_ratio and mcap_ratio > 0 else "N/A"
+
+        tx_count = len(tx_hashes)
+
+        lines = [
+            f"**推送时间**: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}",
+            f"**严重度**: {severity_cn}",
+            f"**链**: {chain}",
+            f"**代币**: {symbol}" + (f" ({coin_id})" if coin_id else ""),
+            f"**合并笔数**: {tx_count}",
+            f"**总数量**: {total_amount:,.4f}",
+            f"**总 USD 价值**: ${total_usd:,.2f}",
+            f"**R 值(占 7d 均量)**: {ratio_pct}",
+            f"**占流通市值**: {mcap_pct}",
+            f"**发送方**: `{from_addr}`" + (f" ({from_label})" if from_label else ""),
+            f"**接收方**: `{to_addr}`" + (f" ({to_label})" if to_label else ""),
+        ]
+        # 交易所方向标识（插到正文最顶部）
+        # 推送门槛已保证：至少一方是交易所(CEX/DEX)；双方都是 CEX 已拦截
+        def _badge(label, kind_out):
+            """生成方向徽章：🔴转出 / 🟢转入，标注 CEX 或 DEX。"""
             if not label:
-                return False
-            low = label.lower()
-            return any(kw in low for kw in EXCHANGE_KEYWORDS)
+                return None
+            if _is_cex(label):
+                tag = "CEX"
+            elif _is_dex(label):
+                tag = "DEX"
+            else:
+                return None
+            icon = "🔴" if kind_out else "🟢"
+            verb = "转出" if kind_out else "转入"
+            return f"{icon} {tag}{verb}: {label}"
 
-        is_to_exchange = _is_exchange(to_label)
-        is_from_exchange = _is_exchange(from_label)
+        from_badge = _badge(from_label, True)   # from 是转出
+        to_badge = _badge(to_label, False)      # to 是转入
+        if from_badge and to_badge:
+            # 罕见：DEX↔DEX 或 DEX↔CEX 双方都是交易所，两个都标
+            lines.insert(0, f"{from_badge}  →  {to_badge}")
+        elif from_badge:
+            lines.insert(0, from_badge)
+        elif to_badge:
+            lines.insert(0, to_badge)
 
-        if is_from_exchange and is_to_exchange:
-            lines.insert(0, f"⚠️ 交易所互转: from=**{from_label}** → to=**{to_label}**")
-        elif is_to_exchange:
-            lines.insert(0, f"⚠️ 接收方为交易所: **{to_label}**（资金流入，关注是否抛售）")
-        elif is_from_exchange:
-            lines.insert(0, f"⚠️ 发送方为交易所: **{from_label}**（提币流出，关注资金动向）")
-        elif to_label and from_label:
-            lines.insert(0, f"ℹ️ 标签地址互转: from=**{from_label}** → to=**{to_label}**")
-        elif to_label:
-            lines.insert(0, f"ℹ️ 接收方命中标签: **{to_label}**")
-        elif from_label:
-            lines.insert(0, f"ℹ️ 发送方命中标签: **{from_label}**")
+        logging.info(
+            "触发告警 [%s@%s] severity=%s usd=%.2f R=%s mcap_ratio=%s txs=%d from=%s to=%s",
+            symbol, chain, severity, total_usd, ratio_pct, mcap_pct, tx_count,
+            from_label or from_addr[:12], to_label or to_addr[:12],
+        )
 
-        logging.info("触发告警 [%s@%s] tx=%s usd=%.2f from_exchange=%s to_exchange=%s",
-                     symbol, chain, tx_hash, usd_value,
-                     from_label or "N/A", to_label or "N/A")
+        if not self.feishu_webhook:
+            logging.info("未配置飞书 webhook，跳过推送 [%s@%s] severity=%s",
+                         symbol, chain, severity)
+            return True  # 视为成功以触发冷却
 
-        # 推送飞书（未配置 webhook 时跳过，仅记日志）
-        if self.feishu_webhook:
-            ok = send_feishu_alert(
-                self.feishu_webhook, title, lines, tx_link,
-                secret=self.feishu_webhook_secret,
-            )
-            # 无论推送是否成功都标记已告警，防止失败时无限重推刷屏
-            self._mark_alerted(chain, tx_hash)
-            if not ok:
-                logging.error("飞书推送失败但已标记 [%s@%s] tx=%s，需人工核查 %s",
-                              symbol, chain, tx_hash, self.log_file)
-        else:
-            logging.info("未配置飞书 webhook，跳过推送 [%s@%s] tx=%s（已标记为已告警）",
-                         symbol, chain, tx_hash)
-            self._mark_alerted(chain, tx_hash)
+        ok = send_feishu_alert(
+            self.feishu_webhook, title, lines, primary_link,
+            secret=self.feishu_webhook_secret,
+            severity=severity,
+        )
+        if not ok:
+            logging.error("飞书推送失败 [%s@%s] severity=%s 主tx=%s，需人工核查 %s",
+                          symbol, chain, severity, primary_tx, self.log_file)
+        return ok
+
 
     # ---- 区间处理（按 chain 维度） ----
     def _process_chain_range(self, chain: str, from_block: int, to_block: int) -> None:
@@ -1233,23 +2224,54 @@ class TransferMonitor:
             state = self.states[chain]
             if state["last_processed_block"] == 0:
                 latest = self.rpcs[chain].block_number()
+                if latest <= 0:
+                    # RPC 瞬时故障拿不到区块号：不能把 0 持久化，否则主循环会
+                    # 从第 1 块开始扫链（每轮仅推进 10 块，追平需数周）。
+                    # 留给主循环的 last==0 兜底分支下轮重试。
+                    logging.warning("[%s] 首次启动获取区块号失败（latest=0），延迟到主循环重试", chain)
+                    continue
                 state["last_processed_block"] = max(0, latest - self.confirmations)
                 logging.info("[%s] 首次启动，从区块 %d 开始",
                              chain, state["last_processed_block"])
                 save_chain_state(self.state_file, chain, state)
 
+        # SIGTERM 优雅退出：systemctl stop/restart 会发 SIGTERM，默认处理直接
+        # 杀死进程，合并窗口内（≤5 分钟）未推送的桶会永久丢失。这里只设置
+        # 标志位并唤醒休眠，flush 统一在主循环退出后执行——信号处理函数中
+        # 不做 HTTP 重试等重活，避免与主流程重入冲突。
+        stop_event = threading.Event()
+
+        def _on_sigterm(signum, frame):  # noqa: ARG001
+            logging.info("收到 SIGTERM 信号，准备优雅退出并强制 flush")
+            stop_event.set()
+
+        signal.signal(signal.SIGTERM, _on_sigterm)
+
         while True:
             try:
+                if stop_event.is_set():
+                    logging.info("SIGTERM 退出标记生效，停止轮询")
+                    break
                 # 定期刷新交易所标签库（超过 refresh_interval 才真正发起请求）
                 self.exchanges.maybe_refresh()
 
                 # 逐链处理新块（每条链独立 block_number / state / eth_getLogs）
+                advanced = False
                 for chain in self.chains:
                     state = self.states[chain]
                     rpc = self.rpcs[chain]
                     latest = rpc.block_number()
                     safe_block = latest - self.confirmations
                     last = state["last_processed_block"]
+                    if last == 0:
+                        # 兜底：首次启动时 RPC 故障未初始化起始块，这里补初始化，
+                        # 保证绝无 safe_block > 0 成立导致从第 1 块扫链的情况
+                        if safe_block > 0:
+                            state["last_processed_block"] = safe_block
+                            advanced = True
+                            logging.info("[%s] 补初始化起始区块 %d", chain, safe_block)
+                        # latest 仍为 0（RPC 故障）→ 本轮跳过该链，下轮重试
+                        continue
                     if safe_block > last:
                         # 单批最多 10 个块：Alchemy 免费档 eth_getLogs 限制
                         # 单次区块跨度 ≤10，超过会 400 错误。出块 ~12s/块，轮询
@@ -1258,14 +2280,34 @@ class TransferMonitor:
                         to_block = min(safe_block, last + 10)
                         self._process_chain_range(chain, last + 1, to_block)
                         state["last_processed_block"] = to_block
-                        save_chain_state(self.state_file, chain, state)
+                        advanced = True
                     # else: 没有新块，静默跳到下一条链
+                # 本轮有链推进 → 一次性原子写全量状态（替代逐链 7 次全量读写）
+                if advanced:
+                    save_all_chain_states(self.state_file, self.states)
+
+                # Aggregator flush：扫描到期合并桶（first_seen + MERGE_WINDOW_SECONDS），
+                # 按 R 值重新分级并推送飞书，推送成功后 from/to 进入冷却。
+                # AGGREGATOR_FLUSH_INTERVAL=30s 控制扫描频率。
+                try:
+                    self.aggregator.flush()
+                except Exception as e:  # noqa: BLE001
+                    logging.exception("Aggregator flush 异常（忽略并继续）: %s", e)
             except KeyboardInterrupt:
                 logging.info("收到中断信号，退出")
                 break
             except Exception as e:  # noqa: BLE001  兜底，保证主循环不挂
                 logging.exception("主循环异常（忽略并继续）: %s", e)
-            time.sleep(self.poll_interval)
+            # 用 Event.wait 替代 time.sleep：SIGTERM 到来时立即唤醒，无需等满轮询间隔
+            stop_event.wait(self.poll_interval)
+
+        # 退出前强制 flush 一次，避免遗漏未到期的合并桶（SIGTERM / Ctrl+C 共用此路径）
+        try:
+            sent = self.aggregator.flush(force=True)
+            if sent:
+                logging.info("退出前强制 flush 推送 %d 条告警", sent)
+        except Exception:  # noqa: BLE001
+            logging.exception("退出前强制 flush 失败")
 
 
 # ------------------------------------------------------------------

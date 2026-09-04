@@ -12,6 +12,9 @@ monitor_state_v2.json
 monitor_state_v2.json.tmp
 alerts_v2.log
 
+# 本地备份产物
+*.bak
+
 # 交易所标签库 —— 本地生成产物（由 sync_exchanges.py 产出，不跟踪）
 exchanges.json
 exchanges.json.tmp
@@ -39,3 +42,8 @@ venv/
 
 # 本地安装的便携工具（沙箱内安装的 Git 等）
 .tools/
+
+# 服务器部署临时凭据与脚本（永不提交）
+.deploy_pwd
+_deploy_vultr.py
+_check_vultr.py
