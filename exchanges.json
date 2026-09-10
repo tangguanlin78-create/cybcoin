@@ -1,6 +1,6 @@
 {
   "_comment": "交易所 / 机构已知热钱包地址标签库。由 sync_exchanges.py 自动维护。",
-  "_updated": 1788937380,
+  "_updated": 1789023564,
   "addresses": {
     "0x0000000000000000000000000000000000000000": "null",
     "0x0000f079e68bbcc79ab9600ace786b0a4db1c83c": "wintermute",
